@@ -29,17 +29,39 @@
  *   scripts and tooling next to the app are left out and listed in the report.
  *   --include adds folders by hand, --all counts every .ts file.
  *
+ * Tests
+ *   Unit tests: coverage reports found in `coverage` folders (lcov.info,
+ *   coverage-final.json, coverage-summary.json or the Istanbul HTML report) are
+ *   read per file and matched to components and services. Nothing is run: the
+ *   report has to exist already (ng test --code-coverage, jest --coverage).
+ *   End-to-end tests (Cypress, Playwright, Protractor, Gherkin) are read as
+ *   text: test titles, the URLs they open or assert, the test ids and selectors
+ *   they use. That is matched against the routes and templates of the app.
+ *   Test ids are the usual attributes (data-testid, data-cy, data-test ...) plus
+ *   any attribute of the project's own that the tests select by. Element ids,
+ *   names and form control names count as well.
+ *   It is a static trace, so it shows less than a real run does; a coverage
+ *   report from an instrumented e2e run can be added with --e2e-coverage.
+ *
  * Usage
  *   node ng-inventory.js [path] [--out <dir>] [--xl <n>] [--include <a,b>] [--all]
+ *                        [--coverage <path>] [--e2e-coverage <path>]
  *                        [--anonymize] [--semicolon] [--ts <path>] [--quiet]
  *   node ng-inventory.js --merge <summary.json> <summary.json> ... [--out <dir>]
  *
  * Output (./ng-inventory-report by default)
- *   summary.md       human-readable report, ends with a sizing sheet
- *   summary.json     the same numbers, machine-readable (the file to send back)
- *   components.csv   one row per component: raw metrics, bucket, reasons
- *   classes.csv      one row per service, guard, interceptor, resolver,
- *                    directive, pipe and module
+ *   summary.md          human-readable report, ends with a sizing sheet
+ *   summary.json        the same numbers, machine-readable (the file to send back)
+ *   components.csv      one row per component: raw metrics, bucket, reasons,
+ *                       unit coverage and e2e trace
+ *   classes.csv         one row per service, guard, interceptor, resolver,
+ *                       directive, pipe and module
+ *   test-gaps.md        what the tests cover and what they miss
+ *   functional-spec.md  what the application does, in the words of its e2e
+ *                       tests (not written with --anonymize)
+ *   routes.csv          every route with its full path and its e2e trace
+ *   e2e-tests.csv       every e2e test: suite, title, status, steps, checks
+ *   operations.csv      named GraphQL operations and whether e2e code names them
  *
  *   --merge writes portfolio.md and portfolio.csv: one row per application
  *   plus a total, built from the summary.json files of several runs.
@@ -49,7 +71,7 @@
 const fs = require('fs');
 const path = require('path');
 
-const VERSION = '1.1.0';
+const VERSION = '1.2.0';
 
 /* ------------------------------------------------------------------ *
  * Tunables: adjust to your own definition of "complex"
@@ -64,6 +86,8 @@ const COUPLING = {
   api: 12, //         inputs + outputs
 };
 const BUMP = { one: 2, two: 4 }; // coupling points that move a component up by 1 / 2 buckets
+const UNIT_OK_PCT = 50; // line coverage from unit tests at or above this counts as "has unit tests" in the gap tables
+const SHARED_MAX = 3; // an e2e trace that points at more candidates than this (components with the same test id, hosts of the same child) is ignored
 
 /* ------------------------------------------------------------------ *
  * Constants
@@ -102,6 +126,27 @@ const TOOLING = {
   other: ['@storybook/angular', 'storybook', 'nx', '@nx/angular', '@nrwl/angular', '@angular-architects/module-federation', '@angular-architects/native-federation', '@module-federation/enhanced', 'single-spa-angular', '@angular/elements'],
 };
 const BUCKETS = ['S', 'M', 'L', 'XL'];
+const COVERAGE_DIR_RE = /^coverage([-_.]|$)|[-_.]coverage$/i;
+const TEST_ID_ATTRS = 'data-test[\\w-]*|data-qa[\\w-]*|data-cy|data-e2e[\\w-]*|data-automation[\\w-]*|data-hook|data-pw|data-aid|data-sel'; // data-testid, data-test-id, data-testing-id, data-qa, data-cy, ...
+let TEST_ID_RE; // a test id in a template: data-testid="x", [attr.data-testid]="'x'"
+let TEST_ID_SEL_END_RE; // a test id that the test code puts together: `[data-cy="${entity}DetailsHeading"]`, getByTestId(`row-${kind}`)
+/** The e2e code may select by an attribute of its own (automation-id, e2e-id ...): those names are added before the templates are read. */
+function setTestIdAttrs(extra) {
+  const names = TEST_ID_ATTRS + extra.map((a) => '|' + a.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('');
+  TEST_ID_RE = new RegExp('(?:^|[\\s"\'])(' + names + ')\\s*=\\s*(["\'])([^"\'{}]+)\\2|\\[attr\\.(' + names + ')\\]\\s*=\\s*"\\s*\'([^\'"{}]+)\'\\s*"', 'gi');
+  TEST_ID_SEL_END_RE = new RegExp('(?:' + names + ')\\s*[~|^$*]?=\\s*["\']?$', 'i');
+}
+setTestIdAttrs([]);
+// other handles a test can take hold of: an element id, a form control name, a name attribute
+const HOOK_RE = /(?:^|[\s"'])(id|name|formControlName)\s*=\s*(["'])([^"'{}\s]+)\2/g;
+const HOOK_KIND = { id: 'id', name: 'name', formcontrolname: 'fc' };
+const TEXT_LOOKUP_RE = /^(getBy|getAllBy|findBy|findAllBy|queryBy|queryAllBy)(Role|Text|Label|LabelText|Placeholder|PlaceholderText|Title|AltText|DisplayValue)$/;
+const TEST_ID_HELPER_RE = /test_?id|by_?cy|data_?cy|by_?qa|data_?qa|data_?test|by_?sel|get_?sel|by_?data|automation_?id|by_?e2e|by_?hook/i;
+const E2E_SUITE_RE = /^(describe|context|suite|fdescribe|xdescribe|test\.describe)(\.(only|skip|fixme|serial|parallel))*$/;
+const E2E_TEST_RE = /^(it|test|specify|fit|xit|xspecify)(\.(only|skip|fixme|fail|failing|concurrent|slow|todo))*$/;
+const STEP_DEF_RE = /^(Given|When|Then|And|But|defineStep)$/;
+const E2E_ACTIONS = new Set(['click', 'dblclick', 'rightclick', 'type', 'clear', 'check', 'uncheck', 'select', 'selectOption', 'selectFile', 'setInputFiles', 'fill', 'press', 'pressSequentially', 'hover', 'tap', 'dragTo', 'drag', 'trigger', 'focus', 'blur', 'submit', 'sendKeys', 'dispatchEvent', 'scrollIntoView', 'scrollTo']);
+const E2E_CHECKS = new Set(['should', 'contains', 'waitForURL', 'waitForSelector', 'waitFor', 'waitForResponse', 'waitForRequest']);
 
 /* ------------------------------------------------------------------ *
  * CLI
@@ -120,7 +165,11 @@ function printHelp() {
       '  --xl <n>       LOC threshold (class + template) for the XL bucket (default: 400)',
       '  --include <a,b> Folders to count as application code on top of the project folders',
       '  --all          Count every .ts file under the path, not only the project folders and what they import',
-      '  --anonymize    Replace file paths, class names, selectors and project names with ids',
+      '  --coverage <p> Unit-test coverage report to read (lcov.info, coverage-final.json, coverage-summary.json',
+      '                 or a folder with one); coverage folders inside the path are found without it',
+      '  --e2e-coverage <p> The same for a coverage report produced by an instrumented end-to-end run',
+      '  --anonymize    Replace file paths, class names, selectors and project names with ids; test titles,',
+      '                 URLs and operation names are left out',
       '  --semicolon    Write CSV files with ; as the separator (Excel with German or other European settings)',
       '  --ts <path>    Path to a typescript package (default: resolved from the scanned project)',
       '  --quiet        Do not print the summary to the console',
@@ -130,7 +179,7 @@ function printHelp() {
 }
 
 function parseArgs(argv) {
-  const o = { root: null, out: null, xl: SIZE.L, anonymize: false, ts: null, quiet: false, merge: null, sep: ',', include: [], all: false };
+  const o = { root: null, out: null, xl: SIZE.L, anonymize: false, ts: null, quiet: false, merge: null, sep: ',', include: [], all: false, coverage: [], e2eCoverage: [] };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '-h' || a === '--help') {
@@ -145,6 +194,8 @@ function parseArgs(argv) {
     else if (a === '--semicolon') o.sep = ';';
     else if (a === '--all') o.all = true;
     else if (a === '--include') o.include = o.include.concat(String(argv[++i] || '').split(',').filter(Boolean));
+    else if (a === '--coverage') o.coverage = o.coverage.concat(String(argv[++i] || '').split(',').filter(Boolean));
+    else if (a === '--e2e-coverage') o.e2eCoverage = o.e2eCoverage.concat(String(argv[++i] || '').split(',').filter(Boolean));
     else if (a === '--ts') o.ts = argv[++i];
     else if (a === '--quiet') o.quiet = true;
     else if (a.charAt(0) === '-') {
@@ -261,18 +312,41 @@ function mergeReports(files, outDir) {
       components: s.components.count, routes: s.routing.routes, unitCases: s.tests.unit.cases,
     };
     for (const k of SIZING) row[k] = s.sizing[k] || 0;
+    // test safety net (reports written by version 1.2 or later)
+    const tg = s.testGaps;
+    const uc = tg && tg.unitCoverage.reportFound ? tg.unitCoverage : null;
+    row.unitLinesHit = uc ? uc.lines.hit : 0;
+    row.unitLinesAll = uc ? uc.lines.found + uc.absentFromReport.estimatedLines : 0;
+    row.screensTraced = tg ? tg.e2e.screens.total - tg.e2e.screens.noTrace - (tg.e2e.screens.undecided || 0) : 0;
+    row.screensListed = tg ? tg.e2e.screens.total : 0;
+    row.componentsNoTests = tg ? ['S', 'M', 'L', 'XL'].reduce((a, b) => a + tg.matrix[b].neither, 0) : 0;
+    row.largeNoTests = tg ? tg.matrix.L.neither + tg.matrix.XL.neither : 0;
+    row.noTestAnalysis = tg ? 0 : 1;
+    row.noCoverageReport = uc ? 0 : 1;
     rows.push(row);
   }
   const total = { app: 'TOTAL', angular: '' };
   for (const k of Object.keys(rows[0])) if (k !== 'app' && k !== 'angular') total[k] = rows.reduce((a, r) => a + r[k], 0);
+  // a summary from before 1.2 says nothing about tests: leave its cells empty instead of showing a zero
+  const older = rows.filter((r) => r.noTestAnalysis).map((r) => r.app);
+  for (const r of rows) if (r.noTestAnalysis) r.componentsNoTests = r.largeNoTests = '';
+  if (older.length === rows.length) total.componentsNoTests = total.largeNoTests = '';
   const all = rows.concat(rows.length > 1 ? [total] : []);
   for (const r of all) {
     r.angularBoundPct = share(r.angularBoundLoc, r.tsLoc);
     r.selfContainedPct = share(r.selfContainedLoc, r.tsLoc);
+    // a total over the applications that happen to have a report would pass for the coverage of all of them
+    r.unitLinePct = r.unitLinesAll && !(r === total && total.noCoverageReport) ? share(r.unitLinesHit, r.unitLinesAll) : '';
+    r.screensTracedPct = r.screensListed ? share(r.screensTraced, r.screensListed) : '';
   }
-  const cols = ['app', 'angular', 'tsLoc', 'templateLoc', 'angularBoundPct', 'selfContainedPct', 'components'].concat(SIZING.slice(0, 4), ['routes', 'unitCases'], SIZING.slice(4));
-  const head = ['App', 'Angular', 'TS LOC', 'Template LOC', 'Angular-bound %', 'Self-contained %', 'Components', 'S', 'M', 'L', 'XL', 'Routes', 'Unit cases', 'Services', 'Guards, interceptors, resolvers', 'Directives', 'Pipes', 'State slices', 'Effects classes', 'Custom form controls', 'Angular-bound packages', 'Screens', 'TestBed cases', 'E2E cases', 'GraphQL call sites'];
-  const md = '# Angular portfolio inventory\n\n' + mdTable(head, all.map((r) => cols.map((c) => (typeof r[c] === 'number' ? num(r[c]) : r[c])))) + '\n\nAngular-bound packages are counted per application, so the total counts a shared package once per application that uses it.\n';
+  const cols = ['app', 'angular', 'tsLoc', 'templateLoc', 'angularBoundPct', 'selfContainedPct', 'components'].concat(SIZING.slice(0, 4), ['routes', 'unitCases'], SIZING.slice(4), ['unitLinePct', 'screensTracedPct', 'componentsNoTests', 'largeNoTests']);
+  const head = ['App', 'Angular', 'TS LOC', 'Template LOC', 'Angular-bound %', 'Self-contained %', 'Components', 'S', 'M', 'L', 'XL', 'Routes', 'Unit cases', 'Services', 'Guards, interceptors, resolvers', 'Directives', 'Pipes', 'State slices', 'Effects classes', 'Custom form controls', 'Angular-bound packages', 'Screens', 'TestBed cases', 'E2E cases', 'GraphQL call sites', 'Unit line coverage % (all app code)', 'Screens with e2e trace %', 'Components with no tests', 'of which L and XL'];
+  const md =
+    '# Angular portfolio inventory\n\n' +
+    mdTable(head, all.map((r) => cols.map((c) => (typeof r[c] === 'number' ? num(r[c]) : r[c])))) +
+    '\n\nAngular-bound packages are counted per application, so the total counts a shared package once per application that uses it.\n' +
+    'Unit line coverage is empty where no coverage report was found, and in the total unless every application has one; it counts application files that the report leaves out as uncovered. The e2e trace is static, see test-gaps.md of each application.\n' +
+    (older.length ? 'No test analysis for ' + older.join(', ') + ': the summary was written by a version before 1.2, so the last four columns are empty there and the totals leave it out. Run the current script on it again.\n' : '');
   fs.mkdirSync(outDir, { recursive: true });
   fs.writeFileSync(path.join(outDir, 'portfolio.md'), md);
   fs.writeFileSync(path.join(outDir, 'portfolio.csv'), csv(all, cols));
@@ -289,6 +363,11 @@ const bump = (obj, key, n) => {
   obj[key] = (obj[key] || 0) + (n === undefined ? 1 : n);
 };
 const sum = (arr, f) => arr.reduce((s, x) => s + (f(x) || 0), 0);
+const topN = (obj, n) =>
+  Object.keys(obj)
+    .map((k) => ({ name: k, count: obj[k] }))
+    .sort((a, b) => b.count - a.count || (a.name < b.name ? -1 : 1))
+    .slice(0, n);
 const fmt = (n) => Number(n || 0).toLocaleString('en-US');
 const pct = (a, b) => (b ? Math.round((a / b) * 100) : 0);
 
@@ -342,7 +421,23 @@ function isDir(p) {
  * ------------------------------------------------------------------ */
 const pkgJsonPath = findUp(ROOT, 'package.json');
 const pkgJson = (pkgJsonPath && readJsonLoose(pkgJsonPath)) || {};
-const declaredDeps = Object.assign({}, pkgJson.peerDependencies, pkgJson.devDependencies, pkgJson.dependencies);
+const depsOf = (j) => Object.assign({}, j.peerDependencies, j.devDependencies, j.dependencies);
+// One app of a monorepo has a thin package.json of its own; the dependencies sit in the one at the repository root.
+// Those above are read up to the folder that holds .git, and not at all when no such folder is found.
+const outerDeps = {};
+if (pkgJsonPath) {
+  const outer = [];
+  let d = path.dirname(pkgJsonPath);
+  let atRepoRoot = fs.existsSync(path.join(d, '.git'));
+  for (let i = 0; i < 8 && !atRepoRoot && path.dirname(d) !== d; i++) {
+    d = path.dirname(d);
+    const j = fs.existsSync(path.join(d, 'package.json')) ? readJsonLoose(path.join(d, 'package.json')) : null;
+    if (j) outer.unshift(j);
+    atRepoRoot = fs.existsSync(path.join(d, '.git'));
+  }
+  if (atRepoRoot) for (const j of outer) Object.assign(outerDeps, depsOf(j));
+}
+const declaredDeps = Object.assign({}, outerDeps, depsOf(pkgJson));
 
 const nodeModulesDirs = [];
 for (let d = ROOT; ; ) {
@@ -515,6 +610,22 @@ function classify(rel) {
 }
 
 const found = { ts: [], spec: [], story: [], testSupport: [], e2e: [], e2eSupport: [], feature: [], graphql: [], html: [], style: [], mfConfig: [], projectJson: [] };
+const coverageDirs = []; // folders that hold coverage reports: not walked for code, read later
+/** A folder called "coverage" is a report folder only when a report is in it; otherwise it is ordinary source. */
+function holdsCoverageReport(dir, depth) {
+  let entries;
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true });
+  } catch (e) {
+    return false;
+  }
+  for (const e of entries) {
+    if (e.isFile() && /^(lcov\.info|coverage-final\.json|coverage-summary\.json|clover\.xml|cobertura-coverage\.xml|index\.html)$/.test(e.name)) return true;
+    if (e.isDirectory() && e.name === 'lcov-report') return true;
+  }
+  if (depth < 2) for (const e of entries) if (e.isDirectory() && holdsCoverageReport(path.join(dir, e.name), depth + 1)) return true;
+  return false;
+}
 (function walk(dir) {
   let entries;
   try {
@@ -525,6 +636,10 @@ const found = { ts: [], spec: [], story: [], testSupport: [], e2e: [], e2eSuppor
   for (const e of entries) {
     const full = path.join(dir, e.name);
     if (e.isDirectory()) {
+      if (COVERAGE_DIR_RE.test(e.name) && full !== opts.out && holdsCoverageReport(full, 0)) {
+        coverageDirs.push(full);
+        continue;
+      }
       if (e.name.charAt(0) === '.' || SKIP_DIRS.has(e.name) || full === opts.out) continue;
       walk(full);
     } else if (e.isFile()) {
@@ -567,7 +682,20 @@ for (const abs of found.projectJson) {
   const j = readJsonLoose(abs) || {};
   const dir = toPosix(path.dirname(relOf(abs)));
   const root = dir === '.' ? '' : dir;
-  addProject(j.name || (root ? path.posix.basename(root) : path.basename(ROOT)), j.projectType, root, j.sourceRoot);
+  // sourceRoot is written from the workspace root, and that may sit above the scanned folder (one app of a monorepo):
+  // "apps/web/src" in apps/web/project.json is the folder src next to it
+  let src = normDir(j.sourceRoot);
+  if (src && !isDir(path.join(ROOT, src))) {
+    const here = toPosix(path.dirname(abs)).split('/');
+    const segs = src.split('/');
+    let fixed = '';
+    for (let k = segs.length - 1; k >= 1 && !fixed; k--) {
+      const rest = segs.slice(k).join('/');
+      if (segs.slice(0, k).join('/') === here.slice(-k).join('/') && isDir(path.join(path.dirname(abs), rest))) fixed = (root ? root + '/' : '') + rest;
+    }
+    src = fixed;
+  }
+  addProject(j.name || (root ? path.posix.basename(root) : path.basename(ROOT)), j.projectType, root, src);
 }
 
 /* ------------------------------------------------------------------ *
@@ -591,8 +719,14 @@ function importSpecifiers(text) {
   }
 }
 const scope = { mode: 'everything', roots: [], importedFromOutside: 0, leftOut: [] };
+let inAppFolders = (_abs) => true;
 {
-  const roots = projects.filter((p) => p.type !== 'e2e').map((p) => p.root || p.sourceRoot);
+  // a project folder that is not there (a stale entry, or paths written from a workspace root above the scanned folder) cannot
+  // define the scope: with none left, every file counts
+  const roots = projects
+    .filter((p) => p.type !== 'e2e')
+    .map((p) => p.root || p.sourceRoot)
+    .filter((r) => r === '' || isDir(path.join(ROOT, r)));
   if (!opts.all && roots.length && roots.every((r) => r !== '')) {
     scope.mode = 'project-folders';
     scope.roots = Array.from(new Set(roots.concat(opts.include.map(normDir).filter(Boolean)))).sort();
@@ -600,6 +734,7 @@ const scope = { mode: 'everything', roots: [], importedFromOutside: 0, leftOut: 
       const rel = relOf(abs);
       return scope.roots.some((r) => rel === r || rel.startsWith(r + '/'));
     };
+    inAppFolders = under;
     const inScope = new Set();
     const queue = [];
     for (const abs of found.ts) {
@@ -673,6 +808,37 @@ function strValue(node) {
 function arrayLen(node) {
   return node && ts.isArrayLiteralExpression(node) ? node.elements.length : 0;
 }
+function isStr(node) {
+  return !!node && (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node));
+}
+function isExprWrapper(node) {
+  return (
+    ts.isAsExpression(node) || ts.isParenthesizedExpression(node) || ts.isNonNullExpression(node) || ts.isTypeAssertionExpression(node) ||
+    (typeof ts.isSatisfiesExpression === 'function' && ts.isSatisfiesExpression(node))
+  );
+}
+/** `x as T`, `(x)`, `x!`, `x satisfies T` -> x */
+function unwrapExpr(node) {
+  while (node && isExprWrapper(node)) node = node.expression;
+  return node;
+}
+/** a.b.c or this.a.b as text; null for anything that is not a plain dotted name */
+function dottedName(expr) {
+  const parts = [];
+  let e = expr;
+  while (ts.isPropertyAccessExpression(e)) {
+    parts.unshift(e.name.text);
+    e = e.expression;
+  }
+  if (ts.isIdentifier(e)) parts.unshift(e.text);
+  else if (e.kind === SK.ThisKeyword) parts.unshift('this');
+  else return null;
+  return parts.join('.');
+}
+function lastFunctionArg(args) {
+  for (let i = args.length - 1; i >= 0; i--) if (ts.isArrowFunction(args[i]) || ts.isFunctionExpression(args[i])) return args[i];
+  return null;
+}
 function typeName(typeNode, sf) {
   return ts.isTypeReferenceNode(typeNode) ? typeNode.typeName.getText(sf) : typeNode.getText(sf);
 }
@@ -741,7 +907,19 @@ const classes = [];
 const routedNames = new Set();
 const routedFiles = new Set();
 const referencedHtml = new Set();
-const fileRecs = new Map(); // absolute path -> { port, loc, deps }
+const fileRecs = new Map(); // absolute path -> { port, loc, deps, runtime }
+const routeArrays = new Map(); // file -> Map(array name -> { file, key, nodes, spreads, refConsumed, lazyConsumed, registered })
+const routerSetups = []; // { file, name }: provideRouter(routes), RouterModule.forRoot(routes), RouterModule.forChild(routes)
+const bootstrapNames = new Set(); // root components: bootstrapApplication(X), @NgModule({ bootstrap: [X] })
+const testIdAttrUse = {}; // test id attribute -> how often templates carry it
+const staticRefs = new Map(); // 'PageModule.component' -> 'PageComponent': static class fields that hold a class, for `component: PageModule.component`
+const routedExprs = new Set(); // route components written as `A.b`, resolved once every file is read
+const ROUTER_SETUP_RE = /^(provideRouter|provideRoutes)$|(^|\.)RouterModule\.(forRoot|forChild)$/;
+const fileImports = new Map(); // file with routes -> Map(local name -> { spec, name })
+let routeAst = new Map(); // route object literal -> route node, for the file being read
+const appConsts = new Map(); // 'Routes.Payments' -> 'payments': top-level string constants, for route paths written as constants
+const gqlOps = new Map(); // 'query Payments' -> { type, name, file }
+const gqlAnonymous = { count: 0 };
 const GENERATED_RE = /@generated|auto-?generated|autogenerated|do not (?:edit|modify)|generated by|openapi generator|swagger-codegen|ng-openapi-gen/i;
 
 /* ------------------------------------------------------------------ *
@@ -769,9 +947,24 @@ function analyzeTemplate(tpl) {
     formBindings: c(/\bformControlName\b|\bformGroupName\b|\bformArrayName\b|\[formControl\]|\[formGroup\]/g),
     ngModel: c(/\bngModel\b/g),
     i18nAttrs: c(/\si18n(?:-[\w\-]+)?(?=[\s=>])/g),
-    pipes: {}, pipeCount: 0, tags: {}, tagPrefixes: {}, attrPrefixes: {},
+    pipes: {}, pipeCount: 0, tags: {}, tagPrefixes: {}, attrPrefixes: {}, testIds: [], testIdAttrs: {}, hooks: [],
   };
   let m;
+  if (tpl.indexOf('=') !== -1) {
+    const ids = new Set();
+    TEST_ID_RE.lastIndex = 0;
+    while ((m = TEST_ID_RE.exec(tpl))) {
+      const id = (m[3] || m[5] || '').trim();
+      if (!id) continue;
+      ids.add(id);
+      bump(t.testIdAttrs, (m[1] || m[4]).toLowerCase());
+    }
+    t.testIds = Array.from(ids);
+    const hooks = new Set();
+    HOOK_RE.lastIndex = 0;
+    while ((m = HOOK_RE.exec(tpl))) hooks.add(HOOK_KIND[m[1].toLowerCase()] + '=' + m[3]);
+    t.hooks = Array.from(hooks);
+  }
   const pipeRe = /(?<![|])\|(?![|])\s*([A-Za-z_]\w*)/g;
   while ((m = pipeRe.exec(tpl))) {
     bump(t.pipes, m[1]);
@@ -820,6 +1013,7 @@ function analyzeClass(cls, sf, lines) {
     methods: 0, hooks: 0, implementsList: [], extendsName: '', subscribes: 0, rxPipes: 0, manualCd: 0, dynamicCreate: 0,
     dispatches: 0, navigations: 0, httpCalls: 0, gqlCalls: 0, subjects: 0, signals: 0, effects: 0, createEffect: 0,
     formControls: 0, formGroups: 0, validatorRefs: 0, ngxsActions: 0, ngxsSelectors: 0, deps: 0,
+    refs: new Set(), // capitalised identifiers used in the class: other components it opens, creates or lists
   };
   for (const h of cls.heritageClauses || []) {
     for (const t of h.types) {
@@ -913,6 +1107,9 @@ function analyzeClass(cls, sf, lines) {
       } else if (SUBJECT_RE.test(t)) ci.subjects++;
     } else if (ts.isPropertyAccessExpression(n) && ts.isIdentifier(n.expression) && n.expression.text === 'Validators') {
       ci.validatorRefs++;
+    } else if (ts.isIdentifier(n)) {
+      const first = n.text.charCodeAt(0);
+      if (first >= 65 && first <= 90) ci.refs.add(n.text);
     }
     ts.forEachChild(n, visit);
   };
@@ -980,6 +1177,7 @@ function recordRoute(obj, sf, proj, abs) {
   if (keys.has('children')) r.withChildren++;
   const comp = keys.get('component');
   if (comp && ts.isPropertyAssignment(comp) && ts.isIdentifier(comp.initializer)) routedNames.add(comp.initializer.text);
+  else if (comp && ts.isPropertyAssignment(comp) && dottedName(unwrapExpr(comp.initializer))) routedExprs.add(dottedName(unwrapExpr(comp.initializer)));
   const lc = keys.get('loadComponent');
   if (lc && ts.isPropertyAssignment(lc)) {
     const text = lc.initializer.getText(sf);
@@ -991,6 +1189,166 @@ function recordRoute(obj, sf, proj, abs) {
       const file = im && resolveSpec(im[1], abs);
       if (file) routedFiles.add(file);
     }
+  }
+
+  // --- the route tree is kept, so that full paths can be put together once every file is read
+  const init = (k) => {
+    const p = keys.get(k);
+    return p && ts.isPropertyAssignment(p) ? p.initializer : undefined;
+  };
+  const IMPORT_RE = /import\(\s*['"]([^'"]+)['"]\s*\)/;
+  const THEN_RE = /\.then\(\s*\(?\s*[\w$]+\s*\)?\s*=>\s*[\w$]+\s*\.\s*([A-Za-z_$][\w$]*)/;
+  const pathInit = unwrapExpr(init('path'));
+  const node = {
+    file: abs, project: proj.name,
+    path: isStr(pathInit) ? pathInit.text : '', pathExpr: pathInit && !isStr(pathInit) ? pathInit.getText(sf) : undefined,
+    component: '', componentFile: null, lazyComponent: false, lazy: null, remote: false,
+    isRedirect: keys.has('redirectTo'), redirectTo: isStr(unwrapExpr(init('redirectTo'))) ? unwrapExpr(init('redirectTo')).text : undefined,
+    redirectExpr: init('redirectTo') && !isStr(unwrapExpr(init('redirectTo'))) ? unwrapExpr(init('redirectTo')).getText(sf) : undefined,
+    guarded: GUARD_KEYS.some((k) => keys.has(k)), children: [], childRefs: [], segs: null, refArrays: [], lazyArrays: [],
+    outlet: keys.has('outlet'), // a secondary outlet (a navbar, a side panel): shown next to a screen, not a screen itself
+  };
+  if (comp && ts.isPropertyAssignment(comp)) {
+    // a class name, a static field that holds one (`PageModule.component`), or something only known at run time: a screen in any case
+    const ce = unwrapExpr(comp.initializer);
+    node.component = ts.isIdentifier(ce) ? ce.text : dottedName(ce) || '(set at run time)';
+  }
+  if (lc && ts.isPropertyAssignment(lc)) {
+    const text = lc.initializer.getText(sf);
+    const im = IMPORT_RE.exec(text);
+    const m = THEN_RE.exec(text);
+    node.lazyComponent = true;
+    node.component = m ? m[1] : '';
+    node.componentFile = im ? resolveSpec(im[1], abs) : null;
+  }
+  const lz = unwrapExpr(init('loadChildren'));
+  if (lz) {
+    const text = lz.getText(sf);
+    let spec = null;
+    let name = 'default';
+    if (isStr(lz)) {
+      // Angular 7 and older: './feature/feature.module#FeatureModule'
+      const parts = lz.text.split('#');
+      spec = parts[0];
+      name = parts[1] || 'default';
+    } else {
+      const im = IMPORT_RE.exec(text);
+      const m = THEN_RE.exec(text);
+      if (im) spec = im[1];
+      if (m) name = m[1];
+      const ref = /^(?:async\s*)?\(\s*\)\s*=>\s*([A-Za-z_$][\w$]*)\s*$/.exec(text);
+      if (!im && ref) node.childRefs.push(ref[1]);
+    }
+    node.remote = /loadRemoteModule|loadRemote\s*\(|remoteEntry/.test(text);
+    node.lazy = { spec: spec, name: name, file: spec ? resolveSpec(spec, abs) : null };
+  }
+  const ch = unwrapExpr(init('children'));
+  if (ch) {
+    if (ts.isIdentifier(ch)) node.childRefs.push(ch.text);
+    else if (ts.isArrayLiteralExpression(ch)) for (const el of ch.elements) if (ts.isSpreadElement(el) && ts.isIdentifier(el.expression)) node.childRefs.push(el.expression.text);
+  }
+  routeAst.set(obj, node);
+  const arr = obj.parent && ts.isArrayLiteralExpression(obj.parent) ? obj.parent : null;
+  let holder = arr ? arr.parent : null;
+  while (holder && isExprWrapper(holder)) holder = holder.parent;
+  const parentNode = holder && ts.isPropertyAssignment(holder) && propName(holder) === 'children' ? routeAst.get(holder.parent) : null;
+  if (parentNode) parentNode.children.push(node);
+  else routeArrayOf(arr, holder, obj, abs, sf).nodes.push(node);
+}
+
+/** The array a top-level route sits in, by the name it can be referred to (variable, `default`, or its position). */
+function routeArrayOf(arr, holder, obj, abs, sf) {
+  let key = '@' + (arr || obj).pos;
+  if (arr && holder) {
+    if (ts.isVariableDeclaration(holder) && ts.isIdentifier(holder.name)) key = holder.name.text;
+    else if (ts.isExportAssignment(holder)) key = 'default';
+    else if (ts.isPropertyDeclaration(holder) && holder.name) key = holder.name.getText(sf);
+  }
+  let byKey = routeArrays.get(abs);
+  if (!byKey) routeArrays.set(abs, (byKey = new Map()));
+  let rec = byKey.get(key);
+  if (!rec) {
+    // an array written straight into provideRouter([...]) or RouterModule.forRoot([...]) is in use by definition
+    const inline = !!holder && ts.isCallExpression(holder) && ROUTER_SETUP_RE.test(dottedName(holder.expression) || '');
+    rec = { file: abs, key: key, nodes: [], spreads: [], refConsumed: false, lazyConsumed: false, registered: inline };
+    if (arr) for (const el of arr.elements) if (ts.isSpreadElement(el) && ts.isIdentifier(el.expression)) rec.spreads.push(el.expression.text);
+    byKey.set(key, rec);
+  }
+  return rec;
+}
+
+/** Top-level string constants (const, enum, static field, one object level deep): route paths are often written with them. */
+function collectAppConsts(sf) {
+  const add = (k, v) => {
+    if (v.length > 200) return;
+    const prev = appConsts.get(k);
+    if (prev === undefined) appConsts.set(k, v);
+    else if (prev !== v) appConsts.set(k, null);
+  };
+  const fromObject = (prefix, o, depth) => {
+    for (const p of o.properties) {
+      if (!ts.isPropertyAssignment(p)) continue;
+      const k = propName(p);
+      const v = unwrapExpr(p.initializer);
+      if (!k || !v) continue;
+      if (isStr(v)) add(prefix + '.' + k, v.text);
+      else if (ts.isObjectLiteralExpression(v) && depth < 2) fromObject(prefix + '.' + k, v, depth + 1);
+    }
+  };
+  for (const st of sf.statements) {
+    if (ts.isVariableStatement(st)) {
+      for (const d of st.declarationList.declarations) {
+        const v = unwrapExpr(d.initializer);
+        if (!v || !ts.isIdentifier(d.name)) continue;
+        if (isStr(v)) add(d.name.text, v.text);
+        else if (ts.isObjectLiteralExpression(v)) fromObject(d.name.text, v, 0);
+      }
+    } else if (ts.isEnumDeclaration(st)) {
+      for (const m of st.members) if (isStr(m.initializer) && propName(m)) add(st.name.text + '.' + propName(m), m.initializer.text);
+    } else if (ts.isClassDeclaration(st) && st.name) {
+      for (const m of st.members) {
+        if (!ts.isPropertyDeclaration(m) || !propName(m)) continue;
+        const v = unwrapExpr(m.initializer);
+        if (isStr(v)) add(st.name.text + '.' + propName(m), v.text);
+      }
+    }
+  }
+}
+
+/** 'Routes.Payments' or `${BASE}/list` -> the string it stands for, when every part is a known constant. */
+function resolveConstText(text) {
+  const t = String(text).trim().replace(/^this\./, '');
+  if (/^[A-Za-z_$][\w$]*(\.[A-Za-z_$][\w$]*)*$/.test(t)) {
+    const v = appConsts.get(t);
+    return typeof v === 'string' ? v : undefined;
+  }
+  if (t.charAt(0) === '`' && t.charAt(t.length - 1) === '`') {
+    let ok = true;
+    const s = t.slice(1, -1).replace(/\$\{([^}]+)\}/g, (_all, inner) => {
+      const v = resolveConstText(inner);
+      if (v === undefined) ok = false;
+      return v || '';
+    });
+    return ok ? s : undefined;
+  }
+  return undefined;
+}
+
+function hasRuntimeCode(sf) {
+  for (const st of sf.statements) {
+    if (ts.isImportDeclaration(st) || ts.isExportDeclaration(st) || ts.isInterfaceDeclaration(st) || ts.isTypeAliasDeclaration(st) || ts.isImportEqualsDeclaration(st) || st.kind === SK.EmptyStatement) continue;
+    if (st.modifiers && st.modifiers.some((m) => m.kind === SK.DeclareKeyword)) continue;
+    return true;
+  }
+  return false;
+}
+
+function collectGqlOps(text, abs) {
+  const re = /(?:^|[\s`}])(query|mutation|subscription)\b\s*([A-Za-z_]\w*)?\s*[({@]/g;
+  let m;
+  while ((m = re.exec(text))) {
+    if (!m[2]) gqlAnonymous.count++;
+    else if (!gqlOps.has(m[1] + ' ' + m[2])) gqlOps.set(m[1] + ' ' + m[2], { type: m[1], name: m[2], file: abs });
   }
 }
 
@@ -1004,6 +1362,11 @@ function walkFile(sf, importsRouter, proj, abs) {
         if (NGRX_CALLS.has(t)) bump(agg.state.ngrx, t);
         else if (t === 'loadRemoteModule') agg.mf.loadRemoteModule++;
         else if (t === 'createCustomElement') agg.mf.createCustomElement++;
+        else if (t === 'bootstrapApplication' && n.arguments.length && ts.isIdentifier(n.arguments[0])) bootstrapNames.add(n.arguments[0].text);
+      }
+      if (importsRouter && n.arguments.length && (ts.isIdentifier(c) || ts.isPropertyAccessExpression(c)) && ROUTER_SETUP_RE.test(dottedName(c) || '')) {
+        const arg = unwrapExpr(n.arguments[0]);
+        if (ts.isIdentifier(arg)) routerSetups.push({ file: abs, name: arg.text });
       }
     } else if (ts.isObjectLiteralExpression(n)) {
       if (importsRouter) recordRoute(n, sf, proj, abs);
@@ -1016,6 +1379,7 @@ function walkFile(sf, importsRouter, proj, abs) {
       else if (tag === 'gql' || tag === 'graphql') {
         agg.gql.documents++;
         agg.gql.operations += Math.max(1, (n.template.getText(sf).match(/(?:^|[\s`}])(?:query|mutation|subscription|fragment)\b/g) || []).length);
+        collectGqlOps(n.template.getText(sf), abs);
       }
     }
     ts.forEachChild(n, visit);
@@ -1047,11 +1411,18 @@ function analyzeTs(abs) {
   const seen = new Set();
   const localDeps = [];
   const importedFrom = new Map(); // local name -> module it was imported from
+  const bindings = new Map(); // local name -> { spec, name of the export }
   for (const st of sf.statements) {
     if (!(ts.isImportDeclaration(st) || ts.isExportDeclaration(st)) || !st.moduleSpecifier || !ts.isStringLiteral(st.moduleSpecifier)) continue;
     const spec = st.moduleSpecifier.text;
     const named = ts.isImportDeclaration(st) && st.importClause && st.importClause.namedBindings;
-    if (named && ts.isNamedImports(named)) for (const el of named.elements) importedFrom.set(el.name.text, spec);
+    if (named && ts.isNamedImports(named)) {
+      for (const el of named.elements) {
+        importedFrom.set(el.name.text, spec);
+        bindings.set(el.name.text, { spec: spec, name: (el.propertyName || el.name).text });
+      }
+    }
+    if (ts.isImportDeclaration(st) && st.importClause && st.importClause.name) bindings.set(st.importClause.name.text, { spec: spec, name: 'default' });
     const local = resolveSpec(spec, abs);
     if (local) localDeps.push(local);
     if (spec.charAt(0) === '.' || spec.charAt(0) === '/') continue;
@@ -1087,19 +1458,33 @@ function analyzeTs(abs) {
   })(sf);
 
   for (const cls of found) {
+    if (cls.name) {
+      for (const m of cls.members) {
+        if (!ts.isPropertyDeclaration(m) || !propName(m) || !(m.modifiers || []).some((x) => x.kind === SK.StaticKeyword)) continue;
+        const v = unwrapExpr(m.initializer);
+        if (!v || !ts.isIdentifier(v)) continue;
+        const key = cls.name.text + '.' + propName(m);
+        staticRefs.set(key, staticRefs.has(key) && staticRefs.get(key) !== v.text ? null : v.text);
+      }
+    }
     let kind = null;
     let meta;
     let isNgxsState = false;
+    let viaService = false;
     for (const d of decoratorsOf(cls)) {
-      const n = decoratorName(d);
+      let n = decoratorName(d);
+      const from = importedFrom.get(n);
+      // Angular 22.1: @Service() stands for @Injectable({ providedIn: 'root' }). Other libraries have a @Service too, so the import decides.
+      const ngService = n === 'Service' && from === '@angular/core';
+      if (ngService) n = 'Injectable';
       if (KIND_RANK[n] === undefined) continue;
       // same decorator names exist elsewhere (NestJS @Injectable, Stencil @Component): trust the import
-      const from = importedFrom.get(n);
       if (n === 'State' ? from !== '@ngxs/store' : from !== undefined && !/^@angular\//.test(from)) continue;
       if (n === 'State') isNgxsState = true;
       if (kind === null || KIND_RANK[n] < KIND_RANK[kind]) {
         kind = n;
         meta = decoratorArg(d);
+        viaService = ngService;
       }
     }
     if (!kind) continue;
@@ -1183,10 +1568,13 @@ function analyzeTs(abs) {
         animations: !!get('animations'), ownProviders: arrayLen(get('providers')) + arrayLen(get('viewProviders')) > 0,
         encapsulationOff: /None/.test(encText), shadowDom: /ShadowDom/.test(encText),
         routed: false, specCases: -1, abs: abs,
+        // kept for the test analysis, not written to the CSV as they are
+        tagList: Object.keys(t.tags), testIdList: t.testIds, hookList: t.hooks, refs: ci.refs,
       };
       Object.assign(c, bucketOf(c));
       c.totalLoc = c.classLoc + c.tplLoc;
       components.push(c);
+      for (const a of Object.keys(t.testIdAttrs)) bump(testIdAttrUse, a, t.testIdAttrs[a]);
       proj.components++;
       proj.buckets[c.bucket]++;
       proj.templateLoc += t.loc;
@@ -1213,7 +1601,8 @@ function analyzeTs(abs) {
         project: proj.name, file: rel, kind: '', name: ci.name, loc: ci.loc, deps: ci.deps, methods: ci.methods,
         subscribes: ci.subscribes, rxPipes: ci.rxPipes, httpCalls: ci.httpCalls, gqlCalls: ci.gqlCalls, subjects: ci.subjects, signals: ci.signals,
         dispatches: ci.dispatches, inputs: ci.inputs, outputs: ci.outputs, hostListeners: ci.hostListeners,
-        detail: '', specCases: -1,
+        detail: '', specCases: -1, abs: abs,
+        refs: ci.refs, // kept for the test analysis: a service or directive that names a component may open or create it
       };
       if (kind === 'Directive') {
         rec.kind = 'directive';
@@ -1227,11 +1616,15 @@ function analyzeTs(abs) {
       } else if (kind === 'NgModule') {
         rec.kind = 'module';
         rec.detail = 'declarations=' + arrayLen(get('declarations')) + ' imports=' + arrayLen(get('imports')) + ' providers=' + arrayLen(get('providers')) + ' exports=' + arrayLen(get('exports'));
+        const boot = get('bootstrap');
+        if (boot && ts.isArrayLiteralExpression(boot)) for (const el of boot.elements) if (ts.isIdentifier(el)) bootstrapNames.add(el.text);
         proj.modules++;
       } else {
         rec.kind = injectableKind(ci, relLower, isNgxsState);
         const prov = get('providedIn');
-        rec.detail = prov ? 'providedIn=' + (strValue(prov) || prov.getText(sf)) : '';
+        const auto = get('autoProvided');
+        if (viaService) rec.detail = auto && auto.kind === SK.FalseKeyword ? 'autoProvided=false' : 'providedIn=root';
+        else rec.detail = prov ? 'providedIn=' + (strValue(prov) || prov.getText(sf)) : '';
         if (isNgxsState) agg.state.ngxsStates++;
         if (/^ComponentStore/.test(ci.extendsName)) agg.state.componentStores++;
         proj.injectables++;
@@ -1240,10 +1633,14 @@ function analyzeTs(abs) {
     }
   }
 
+  routeAst = new Map();
   walkFile(sf, importsRouter, proj, abs);
+  routeAst = new Map();
+  if (importsRouter) fileImports.set(abs, bindings);
+  collectAppConsts(sf);
 
   const port = bound ? 'angular' : rx ? 'rxjs' : 'free';
-  fileRecs.set(abs, { port: port, loc: loc, deps: localDeps });
+  fileRecs.set(abs, { port: port, loc: loc, deps: localDeps, runtime: hasRuntimeCode(sf) });
   agg.ts.files++;
   agg.ts.loc += loc;
   agg.port[port].files++;
@@ -1251,6 +1648,33 @@ function analyzeTs(abs) {
   proj.tsFiles++;
   proj.tsLoc += loc;
   proj[port + 'Loc'] += loc;
+}
+
+/* ------------------------------------------------------------------ *
+ * Before the templates are read: which attributes does the e2e code select by?
+ * A project may have a test id attribute of its own (automation-id, e2e-id, data-anything). One that the tests use
+ * with three different values or more is taken as a test id attribute, next to the usual names.
+ * ------------------------------------------------------------------ */
+const extraTestIdAttrs = [];
+{
+  const use = new Map();
+  const known = new RegExp('^(?:' + TEST_ID_ATTRS + ')$', 'i');
+  const re = /\[\s*([A-Za-z][\w-]*)\s*[~|^$*]?=\s*\\?["']?([\w .:-]+)/g;
+  for (const abs of found.e2e.concat(found.e2eSupport)) {
+    const text = readText(abs);
+    let m;
+    re.lastIndex = 0;
+    while ((m = re.exec(text))) {
+      const a = m[1].toLowerCase();
+      if (known.test(a) || !/^data-|test|e2e|qa|automation|(^|-)cy(-|$)/.test(a)) continue;
+      if (/^data-(bs-|mat-|cdk-|toggle$|target$|dismiss$|placement$|parent$|ride$|slide)/.test(a)) continue; // UI library plumbing
+      if (!use.has(a)) use.set(a, new Set());
+      use.get(a).add(m[2].trim());
+    }
+  }
+  for (const [a, values] of use) if (values.size >= 3) extraTestIdAttrs.push(a);
+  extraTestIdAttrs.sort();
+  if (extraTestIdAttrs.length) setTestIdAttrs(extraTestIdAttrs);
 }
 
 /* ------------------------------------------------------------------ *
@@ -1270,7 +1694,171 @@ found.ts.forEach((abs, i) => {
     agg.port.angular.loc += loc;
   }
 });
+for (const x of routedExprs) if (staticRefs.get(x)) routedNames.add(staticRefs.get(x));
 for (const c of components) c.routed = routedNames.has(c.name) || routedFiles.has(c.abs);
+
+/* ------------------------------------------------------------------ *
+ * Route tree: full paths, with lazy modules and route files mounted where they are loaded
+ * ------------------------------------------------------------------ */
+const routeList = []; // { segs, path, node, parent, e2e, comps }
+const routeNotes = { unresolvedPaths: 0, unresolvedLazy: 0, remote: 0, unmounted: 0, truncated: false };
+const compByName = new Map();
+const compByFile = new Map();
+for (const c of components) {
+  if (!compByName.has(c.name)) compByName.set(c.name, []);
+  compByName.get(c.name).push(c);
+  if (!compByFile.has(c.abs)) compByFile.set(c.abs, []);
+  compByFile.get(c.abs).push(c);
+}
+{
+  const allArrays = [];
+  for (const byKey of routeArrays.values()) for (const arr of byKey.values()) allArrays.push(arr);
+  allArrays.sort((a, b) => (a.file < b.file ? -1 : a.file > b.file ? 1 : a.key < b.key ? -1 : 1));
+  const eachNode = (nodes, f) => {
+    for (const n of nodes) {
+      f(n);
+      eachNode(n.children, f);
+    }
+  };
+  // an array used by name: `children: adminRoutes`, `[...adminRoutes]`, `provideRouter(routes)`.
+  // The name may come through an index.ts that re-exports it, so the files behind the import are searched too.
+  const refTarget = (file, name) => {
+    const own = routeArrays.get(file);
+    if (own && own.has(name)) return own.get(name);
+    const b = (fileImports.get(file) || new Map()).get(name);
+    const dep = b ? resolveSpec(b.spec, file) : null;
+    if (!dep) return null;
+    const seen = new Set([dep]);
+    let level = [dep];
+    for (let depth = 0; depth < 4 && level.length; depth++) {
+      const next = [];
+      for (const f of level) {
+        const arrs = routeArrays.get(f);
+        if (arrs && arrs.has(b.name)) return arrs.get(b.name);
+        if (arrs) continue; // a route file that does not have the name: do not wander off through its imports
+        for (const d of (fileRecs.get(f) || { deps: [] }).deps) {
+          if (seen.has(d)) continue;
+          seen.add(d);
+          next.push(d);
+        }
+      }
+      level = next;
+    }
+    return null;
+  };
+  // the arrays a loadChildren import leads to: in the file itself, or in the routing file its module imports
+  const STRUCTURAL = /(^|\/)index\.ts$|\.module\.ts$|rout/i;
+  const lazyTargets = (lazy) => {
+    const seen = new Set([lazy.file]);
+    let level = [lazy.file];
+    for (let depth = 0; depth < 4 && level.length; depth++) {
+      const hits = [];
+      for (const f of level) {
+        const own = routeArrays.get(f);
+        if (!own) continue;
+        if (own.has(lazy.name)) return [own.get(lazy.name)];
+        for (const a of own.values()) if (!a.refConsumed) hits.push(a);
+      }
+      if (hits.length) return hits;
+      const next = [];
+      for (const f of level) {
+        const rec = fileRecs.get(f);
+        if (!rec) continue;
+        for (const d of rec.deps) {
+          if (seen.has(d)) continue;
+          seen.add(d);
+          if (depth === 0 || STRUCTURAL.test(toPosix(d))) next.push(d);
+        }
+      }
+      level = next;
+    }
+    return [];
+  };
+  for (const arr of allArrays) {
+    for (const s of arr.spreads) {
+      const t = refTarget(arr.file, s);
+      if (t && t !== arr) t.refConsumed = true;
+    }
+    eachNode(arr.nodes, (n) => {
+      n.refArrays = n.childRefs.map((r) => refTarget(n.file, r)).filter(Boolean);
+      for (const t of n.refArrays) t.refConsumed = true;
+      if (n.redirectTo === undefined && n.redirectExpr !== undefined) n.redirectTo = resolveConstText(n.redirectExpr);
+      if (n.pathExpr === undefined) n.segs = n.path.split('/').filter(Boolean);
+      else {
+        const v = resolveConstText(n.pathExpr);
+        if (v === undefined) routeNotes.unresolvedPaths++;
+        n.segs = v === undefined ? ['{?}'] : v.split('/').filter(Boolean);
+      }
+    });
+  }
+  for (const arr of allArrays) {
+    eachNode(arr.nodes, (n) => {
+      if (!n.lazy) return;
+      n.lazyArrays = n.lazy.file ? lazyTargets(n.lazy) : [];
+      for (const t of n.lazyArrays) t.lazyConsumed = true;
+      if (n.remote) routeNotes.remote++;
+      else if (!n.lazyArrays.length && !n.refArrays.length) routeNotes.unresolvedLazy++;
+    });
+  }
+  // arrays handed to the router are the entry points; an array nothing refers to is left out as dead code.
+  // When a registration cannot be traced to its array, every free array is taken instead, to be on the safe side.
+  let untraced = 0;
+  for (const r of routerSetups) {
+    const t = refTarget(r.file, r.name);
+    if (t) t.registered = true;
+    else untraced++;
+  }
+  const free = allArrays.filter((a) => !a.refConsumed && !a.lazyConsumed);
+  let roots = free;
+  if (!untraced && free.some((a) => a.registered)) {
+    roots = free.filter((a) => a.registered);
+    routeNotes.unmounted = sum(free.filter((a) => !a.registered), (a) => a.nodes.length);
+  }
+  if (!roots.length) roots = allArrays.filter((a) => !a.refConsumed);
+  const stack = new Set();
+  const expandNode = (n, prefix, parent) => {
+    const segs = prefix.concat(n.segs);
+    const entry = { segs: segs, path: '/' + segs.join('/'), node: n, parent: parent, e2e: '', comps: [] };
+    routeList.push(entry);
+    for (const c of n.children) expandNode(c, segs, entry);
+    for (const t of n.refArrays) expandArray(t, segs, entry);
+    for (const t of n.lazyArrays) expandArray(t, segs, entry);
+  };
+  const expandArray = (arr, prefix, parent) => {
+    if (stack.has(arr)) return;
+    if (routeList.length > 20000) {
+      routeNotes.truncated = true;
+      return;
+    }
+    stack.add(arr);
+    for (const n of arr.nodes) expandNode(n, prefix, parent);
+    for (const s of arr.spreads) {
+      const t = refTarget(arr.file, s);
+      if (t) expandArray(t, prefix, parent);
+    }
+    stack.delete(arr);
+  };
+  for (const r of roots) expandArray(r, [], null);
+
+  for (const e of routeList) {
+    const n = e.node;
+    if (!n.component && !n.componentFile) continue;
+    if (staticRefs.get(n.component)) n.component = staticRefs.get(n.component);
+    let list = n.component ? compByName.get(n.component) || [] : [];
+    if (n.componentFile) {
+      const inFile = (compByFile.get(n.componentFile) || []).filter((c) => !n.component || c.name === n.component);
+      if (inFile.length) list = inFile;
+    } else if (list.length > 1) {
+      // the same class name in several files: the import of the route file says which one
+      const b = (fileImports.get(n.file) || new Map()).get(n.component);
+      const dep = b ? resolveSpec(b.spec, n.file) : null;
+      const exact = dep ? list.filter((c) => c.abs === dep) : [];
+      if (exact.length) list = exact;
+    }
+    e.comps = list;
+  }
+}
+const isScreen = (e) => !e.node.outlet && !!(e.node.component || e.node.componentFile || e.node.lazyComponent);
 
 // Framework-free files with no local import chain (type imports included) that leads to Angular-bound code
 const selfContained = { files: 0, loc: 0 };
@@ -1345,41 +1933,422 @@ for (const abs of found.spec) {
 for (const c of components) c.specCases = specCasesByFile.has(c.file) ? specCasesByFile.get(c.file) : -1;
 for (const c of classes) c.specCases = specCasesByFile.has(c.file) ? specCasesByFile.get(c.file) : -1;
 
+/* ------------------------------------------------------------------ *
+ * End-to-end tests, read as text: titles, the URLs they open or assert, what they touch
+ * ------------------------------------------------------------------ */
 const e2e = { files: 0, loc: 0, cases: 0, byFramework: {}, featureFiles: 0, scenarios: 0, supportFiles: found.e2eSupport.length };
-for (const abs of found.e2e) {
-  const text = readText(abs);
-  const cases = (text.match(TEST_CASE_RE) || []).length;
-  let fw = 'other';
-  if (/\bcy\.\w+\(/.test(text) || /\.cy\.(ts|js)$/i.test(abs)) fw = 'cypress';
-  else if (/@playwright\/test|\bpage\.(?:goto|locator|getBy\w+)\(/.test(text)) fw = 'playwright';
-  else if (/from\s+['"]protractor['"]|\belement\(\s*by\./.test(text)) fw = 'protractor';
-  e2e.files++;
-  e2e.loc += nonBlank(text);
-  e2e.cases += cases;
-  if (!e2e.byFramework[fw]) e2e.byFramework[fw] = { files: 0, cases: 0 };
-  e2e.byFramework[fw].files++;
-  e2e.byFramework[fw].cases += cases;
-  const p = projectOf(relOf(abs));
-  p.e2eFiles++;
-  p.e2eCases += cases;
+const e2eStatic = { tests: [], navs: [], literals: new Set(), affixes: new Map(), hooks: new Set(), lookups: { testIdCalls: 0, textCalls: 0 }, stubs: 0, stepDefs: 0, consts: new Map(), features: [], parseErrors: 0 };
+// tests written through page objects name no framework: the folder, its other files and package.json do
+const E2E_TOOL_DEPS = {
+  cypress: ['cypress'], playwright: ['playwright', '@playwright/test', 'playwright-core'], protractor: ['protractor'],
+  webdriverio: ['webdriverio', '@wdio/cli'], testcafe: ['testcafe'],
+};
+const E2E_TOOL_DIR_RE = /(^|[-_.])(cypress|playwright|protractor|wdio|webdriverio|testcafe)([-_.]|$)/i;
+function onlyE2eTool(deps) {
+  const tools = Object.keys(E2E_TOOL_DEPS).filter((n) => E2E_TOOL_DEPS[n].some((d) => deps[d]));
+  return tools.length === 1 ? tools[0] : null;
+}
+const singleE2eTool = onlyE2eTool(declaredDeps);
+const nestedToolCache = new Map();
+/** The one e2e tool of the closest package.json between a test file and the scanned root (`e2e/package.json`). */
+function nestedE2eTool(dir) {
+  if (dir === ROOT || dir.length <= ROOT.length || path.dirname(dir) === dir) return null;
+  if (nestedToolCache.has(dir)) return nestedToolCache.get(dir);
+  const pj = path.join(dir, 'package.json');
+  const json = fs.existsSync(pj) ? readJsonLoose(pj) : null;
+  const tool = json ? onlyE2eTool(depsOf(json)) : nestedE2eTool(path.dirname(dir));
+  nestedToolCache.set(dir, tool);
+  return tool;
+}
+/** The folder that holds a suite of e2e tests: the path up to the first `e2e`, `cypress`, `e2e-playwright` ... segment. */
+function e2eHomeOf(rel) {
+  const segs = rel.split('/');
+  for (let i = 0; i < segs.length - 1; i++) if (E2E_DIR_RE.test(segs[i])) return segs.slice(0, i + 1).join('/');
+  return segs.slice(0, -1).join('/');
+}
+function e2eFrameworkOf(text, abs) {
+  if (/\bcy\.\w+\(/.test(text) || /\.cy\.(ts|js|cjs|mjs)$/i.test(abs)) return 'cypress';
+  if (/@playwright\/test|\bpage\.(?:goto|locator|getBy\w+)\(/.test(text)) return 'playwright';
+  if (/from\s+['"]protractor['"]|\belement\(\s*by\./.test(text)) return 'protractor';
+  if (/from\s+['"](?:@wdio\/globals|webdriverio)['"]|\bbrowser\.url\(/.test(text)) return 'webdriverio';
+  if (/from\s+['"]testcafe['"]/.test(text)) return 'testcafe';
+  const m = relOf(abs).split('/').slice(0, -1).map((seg) => E2E_TOOL_DIR_RE.exec(seg)).filter(Boolean)[0];
+  if (m) return m[2].toLowerCase() === 'wdio' ? 'webdriverio' : m[2].toLowerCase();
+  return 'other';
+}
+const cleanTitle = (s) => String(s).replace(/\s+/g, ' ').trim();
+function titleOf(arg, sf) {
+  if (!arg) return '';
+  if (isStr(arg)) return cleanTitle(arg.text);
+  const t = cleanTitle(arg.getText(sf));
+  if (ts.isTemplateExpression(arg)) return t.slice(1, -1);
+  return t.length > 140 ? t.slice(0, 137) + '...' : t;
+}
+/** URL-like string constants of the e2e code: `const LOGIN = '/login'`, `urls.login`, `Paths.Login`, `LoginPage.url`. */
+function collectE2eConsts(sf, fileConsts) {
+  const pathLike = (s) => s.length < 300 && /^(\/|#\/|https?:\/\/)/.test(s);
+  const add = (k, v) => {
+    for (const m of [fileConsts, e2eStatic.consts]) {
+      const prev = m.get(k);
+      if (prev === undefined) m.set(k, v);
+      else if (prev !== v) m.set(k, null);
+    }
+  };
+  const visit = (n) => {
+    if (ts.isVariableDeclaration(n) && ts.isIdentifier(n.name)) {
+      const v = unwrapExpr(n.initializer);
+      if (isStr(v) && pathLike(v.text)) add(n.name.text, v.text);
+    } else if (ts.isPropertyAssignment(n)) {
+      const v = unwrapExpr(n.initializer);
+      const k = propName(n);
+      if (k && isStr(v) && pathLike(v.text)) {
+        let owner = n.parent.parent;
+        while (owner && isExprWrapper(owner)) owner = owner.parent;
+        if (owner && ts.isVariableDeclaration(owner) && ts.isIdentifier(owner.name)) add(owner.name.text + '.' + k, v.text);
+        else if (owner && ts.isPropertyDeclaration(owner) && propName(owner)) add(propName(owner) + '.' + k, v.text);
+      }
+    } else if (ts.isEnumMember(n)) {
+      if (isStr(n.initializer) && pathLike(n.initializer.text) && propName(n)) add(n.parent.name.text + '.' + propName(n), n.initializer.text);
+    } else if (ts.isPropertyDeclaration(n) && ts.isClassLike(n.parent) && n.parent.name) {
+      const v = unwrapExpr(n.initializer);
+      if (propName(n) && isStr(v) && pathLike(v.text)) add(n.parent.name.text + '.' + propName(n), v.text);
+    }
+    ts.forEachChild(n, visit);
+  };
+  visit(sf);
+}
+/** /\/payments\/\d+$/ -> { url: '/payments/*', partial: true } */
+function regexToUrl(literal) {
+  let src = literal.slice(1, literal.lastIndexOf('/'));
+  const start = src.charAt(0) === '^';
+  const end = /(^|[^\\])\$$/.test(src);
+  src = src.replace(/^\^/, '').replace(/\$$/, '');
+  src = src
+    .replace(/\\\//g, '/')
+    .replace(/\\[dwsDWS][+*?]*|\[[^\]]*\][+*?]*|\((?:[^()]|\([^()]*\))*\)[+*?]*|\.[+*]\??/g, '*')
+    .replace(/\\(.)/g, '$1')
+    .replace(/[?+]+$/, '');
+  return { url: src, partial: !(start && end) };
+}
+function analyzeE2eFile(p) {
+  const sf = p.sf;
+  const rel = p.rel;
+  const fw = p.framework;
+  const suites = [];
+  let cur = null;
+  let count = 0;
+  // what a skipped test does never happens: its URLs, ids and selectors must not count as a trace
+  const dead = () => (cur ? cur.status === 'skipped' || cur.status === 'pending' : suites.some((s) => s.skipped));
+  const lit = (s) => {
+    if (s && s.length < 400 && !dead()) e2eStatic.literals.add(s);
+  };
+  const constOf = (x) => {
+    if (ts.isPropertyAccessExpression(x) && x.expression.kind === SK.ThisKeyword) {
+      // this.url -> a field of the class the call sits in
+      for (let c = x.parent; c; c = c.parent) {
+        if (!ts.isClassLike(c)) continue;
+        for (const m of c.members) {
+          if (!ts.isPropertyDeclaration(m) || propName(m) !== x.name.text) continue;
+          const v = unwrapExpr(m.initializer);
+          if (isStr(v)) return v.text;
+        }
+        break;
+      }
+    }
+    let name = dottedName(x);
+    if (!name) return undefined;
+    name = name.replace(/^this\./, '');
+    const parts = name.split('.');
+    const keys = parts.length > 2 ? [name, parts.slice(-2).join('.')] : [name];
+    for (const k of keys) {
+      for (const m of [p.consts, e2eStatic.consts]) if (typeof m.get(k) === 'string') return m.get(k);
+      // constants of the application itself (route enums), but not bare lower-case names: those are local variables
+      if ((k.indexOf('.') !== -1 || /^[A-Z][A-Z0-9_]*$/.test(k)) && typeof appConsts.get(k) === 'string') return appConsts.get(k);
+    }
+    return undefined;
+  };
+  const urlOf = (x) => {
+    x = unwrapExpr(x);
+    if (!x) return '*';
+    if (isStr(x)) return x.text;
+    if (ts.isTemplateExpression(x)) {
+      let s = x.head.text;
+      for (const sp of x.templateSpans) {
+        const v = constOf(unwrapExpr(sp.expression));
+        s += (v === undefined ? '*' : v) + sp.literal.text;
+      }
+      return s;
+    }
+    if (ts.isBinaryExpression(x) && x.operatorToken.kind === SK.PlusToken) return urlOf(x.left) + urlOf(x.right);
+    if (ts.isObjectLiteralExpression(x)) {
+      for (const pr of x.properties) if (ts.isPropertyAssignment(pr) && propName(pr) === 'url') return urlOf(pr.initializer);
+      return '*';
+    }
+    if (ts.isIdentifier(x) || ts.isPropertyAccessExpression(x)) {
+      const v = constOf(x);
+      return v === undefined ? '*' : v;
+    }
+    return '*';
+  };
+  const nav = (kind, arg, partial) => {
+    const a = unwrapExpr(arg);
+    if (!a) return;
+    let url;
+    if (ts.isRegularExpressionLiteral(a)) {
+      const r = regexToUrl(a.text);
+      url = r.url;
+      partial = r.partial;
+    } else url = urlOf(a);
+    if (cur && kind === 'visit') cur.visits.push(url);
+    if (!dead()) e2eStatic.navs.push({ kind: kind, raw: url, partial: !!partial, file: rel });
+  };
+  const chainHas = (expr, names) => {
+    for (let e = expr; e; ) {
+      if (ts.isCallExpression(e)) {
+        if (ts.isPropertyAccessExpression(e.expression) && names.indexOf(e.expression.name.text) !== -1) return true;
+        e = e.expression;
+      } else if (ts.isPropertyAccessExpression(e)) e = e.expression;
+      else break;
+    }
+    return false;
+  };
+  const isUrlExpect = (recv) => {
+    let e = recv;
+    while (e && ts.isPropertyAccessExpression(e)) e = e.expression;
+    if (!e || !ts.isCallExpression(e) || !e.arguments.length) return false;
+    const callee = dottedName(e.expression);
+    return !!callee && /^expect(\.soft)?$/.test(callee) && /getCurrentUrl|\.url\(\)|location\.(href|pathname|hash)|currentUrl/i.test(e.arguments[0].getText(sf));
+  };
+  const isPlus = (x) => !!x && ts.isBinaryExpression(x) && x.operatorToken.kind === SK.PlusToken;
+  // the fixed pieces of a string that is put together at run time; one gap per variable part
+  const chunksOf = (x) => {
+    const chunks = [''];
+    (function walk(y) {
+      y = unwrapExpr(y);
+      if (isPlus(y)) {
+        walk(y.left);
+        walk(y.right);
+      } else if (y && isStr(y)) chunks[chunks.length - 1] += y.text;
+      else if (y && ts.isTemplateExpression(y)) {
+        chunks[chunks.length - 1] += y.head.text;
+        for (const sp of y.templateSpans) chunks.push(sp.literal.text);
+      } else chunks.push('');
+    })(x);
+    return chunks;
+  };
+  // `[data-cy="${entity}DetailsHeading"]` -> ids that end in "DetailsHeading"; the other half is a literal at the call site
+  const composed = (n) => {
+    if (dead()) return;
+    const chunks = chunksOf(n);
+    const par = n.parent;
+    const callee = par && ts.isCallExpression(par) && par.arguments.indexOf(n) !== -1 ? dottedName(par.expression) : undefined;
+    const helper = !!callee && TEST_ID_HELPER_RE.test(callee.split('.').pop());
+    for (let i = 1; i < chunks.length; i++) {
+      const left = chunks[i - 1];
+      const right = chunks[i];
+      const a = /[\w-]*$/.exec(left)[0];
+      const b = /^[\w-]*/.exec(right)[0];
+      if (!a && !b) continue; // the whole id is a variable: its value is a literal somewhere else
+      if ((a === left && i > 1) || (b === right && i < chunks.length - 1)) continue; // the id runs on into another variable part
+      const before = left.slice(0, left.length - a.length);
+      const wholeArg = helper && before === '' && b === right;
+      if (wholeArg || TEST_ID_SEL_END_RE.test(before)) e2eStatic.affixes.set(a + '\u0000' + b, { a: a, b: b });
+    }
+  };
+  const visit = (n) => {
+    if (ts.isStringLiteral(n) || ts.isNoSubstitutionTemplateLiteral(n)) lit(n.text);
+    else if (ts.isTemplateExpression(n)) {
+      lit(n.head.text);
+      for (const s of n.templateSpans) lit(s.literal.text);
+      if (!isPlus(n.parent)) composed(n);
+    } else if (ts.isRegularExpressionLiteral(n)) lit(n.text);
+    else if (isPlus(n) && !isPlus(n.parent)) composed(n);
+    else if (ts.isCallExpression(n) && call(n)) return;
+    ts.forEachChild(n, visit);
+  };
+  // returns true when the call was a suite or a test and its arguments have been walked already
+  const call = (n) => {
+    let callee = n.expression;
+    let each = false;
+    if (ts.isCallExpression(callee) && ts.isPropertyAccessExpression(callee.expression) && callee.expression.name.text === 'each') {
+      each = true; // it.each(table)('title', fn)
+      callee = callee.expression.expression;
+    } else if (ts.isTaggedTemplateExpression(callee) && ts.isPropertyAccessExpression(callee.tag) && callee.tag.name.text === 'each') {
+      each = true; // it.each`table`('title', fn)
+      callee = callee.tag.expression;
+    }
+    const name = dottedName(callee);
+    const args = n.arguments;
+    if (name) {
+      const fn = lastFunctionArg(args);
+      const literalTitle = args.length > 0 && args[0] !== fn && (isStr(args[0]) || ts.isTemplateExpression(args[0]) || (ts.isBinaryExpression(args[0]) && args[0].operatorToken.kind === SK.PlusToken));
+      if (E2E_SUITE_RE.test(name) && fn && args.length <= 3) {
+        suites.push({ title: args[0] === fn ? '' : titleOf(args[0], sf), skipped: /\.(skip|fixme)\b|^xdescribe/.test(name), only: /\.only\b|^fdescribe/.test(name) });
+        for (const a of args) visit(a);
+        suites.pop();
+        return true;
+      }
+      if (!cur && E2E_TEST_RE.test(name) && args.length > 0 && (literalTitle || (fn && args[0] !== fn))) {
+        const skipped = /^x(it|specify)\b|\.(skip|fixme)\b/.test(name) || suites.some((s) => s.skipped);
+        const only = /^fit\b|\.only\b/.test(name) || suites.some((s) => s.only);
+        const pending = /\.todo\b/.test(name) || args.length === 1;
+        const t = {
+          file: rel, framework: fw, suite: suites.map((s) => s.title).filter(Boolean), title: titleOf(args[0], sf),
+          status: skipped ? 'skipped' : pending ? 'pending' : only ? 'only' : 'active',
+          each: each, steps: [], actions: 0, checks: 0, calls: 0, visits: [],
+        };
+        e2eStatic.tests.push(t);
+        count++;
+        cur = t;
+        for (const a of args) visit(a);
+        cur = null;
+        return true;
+      }
+      if (name === 'test.step' && cur && args.length) cur.steps.push(titleOf(args[0], sf));
+      else if (STEP_DEF_RE.test(name) && args.length >= 2 && fn) e2eStatic.stepDefs++;
+      else if (cur && /^(expect|assert)(\.|$)/.test(name)) cur.checks++;
+    }
+    if (cur) cur.calls++;
+    if (!ts.isPropertyAccessExpression(n.expression)) return false;
+    const pn = n.expression.name.text;
+    const recv = n.expression.expression;
+    if (cur) {
+      if (E2E_ACTIONS.has(pn)) cur.actions++;
+      else if (E2E_CHECKS.has(pn)) cur.checks++;
+    }
+    if (!args.length) return false;
+    if (!dead()) {
+      // how the tests find their elements: through a test id helper, or by what the user sees (text, role, label)
+      if (TEXT_LOOKUP_RE.test(pn) || (pn === 'contains' && fw === 'cypress')) e2eStatic.lookups.textCalls++;
+      else if (TEST_ID_HELPER_RE.test(pn)) e2eStatic.lookups.testIdCalls++;
+      // Protractor and Selenium: by.id('x'), By.name('x')
+      const a0 = unwrapExpr(args[0]);
+      if ((pn === 'id' || pn === 'name') && ts.isIdentifier(recv) && /^by$/i.test(recv.text) && a0 && isStr(a0)) e2eStatic.hooks.add(pn + '=' + a0.text);
+    }
+    if (pn === 'visit' || pn === 'goto' || ((pn === 'get' || pn === 'url') && ts.isIdentifier(recv) && recv.text === 'browser')) nav('visit', args[0], false);
+    else if (pn === 'toHaveURL' || pn === 'waitForURL') nav('assert', args[0], false);
+    else if (pn === 'should' && args.length >= 2 && isStr(args[0]) && chainHas(recv, ['url', 'location', 'hash'])) {
+      if (/include|contain|eq|equal|match|string/.test(args[0].text)) nav('assert', args[1], !/^(eq|equal|eql)$/.test(args[0].text));
+    } else if (/^(toContain|toEqual|toBe|toMatch|toStrictEqual)$/.test(pn) && isUrlExpect(recv)) nav('assert', args[0], pn === 'toContain' || pn === 'toMatch');
+    else if ((pn === 'intercept' || (pn === 'route' && /^(cy|page|context|browserContext|this\.page|this\.context)$/.test(dottedName(recv) || ''))) && !dead()) e2eStatic.stubs++;
+    return false;
+  };
+  visit(sf);
+  return count;
+}
+function parseFeature(text, rel) {
+  const f = { file: rel, name: '', tags: [], description: [], background: [], scenarios: [] };
+  let cur = null;
+  let tags = [];
+  let rule = '';
+  let section = 'head';
+  let inDoc = false;
+  let header = false;
+  for (const raw of text.split(/\r?\n/)) {
+    const line = raw.trim();
+    if (/^("""|```)/.test(line)) {
+      inDoc = !inDoc;
+      continue;
+    }
+    if (inDoc || !line || line.charAt(0) === '#') continue;
+    if (line.charAt(0) === '@') {
+      tags = tags.concat(line.split(/\s+/).filter((t) => t.charAt(0) === '@'));
+      continue;
+    }
+    let m;
+    if ((m = /^Feature:\s*(.*)$/.exec(line))) {
+      f.name = m[1];
+      f.tags = tags;
+      tags = [];
+      section = 'feature';
+    } else if ((m = /^(Scenario Outline|Scenario Template|Scenario|Example):\s*(.*)$/.exec(line))) {
+      cur = { name: m[2], outline: /Outline|Template/.test(m[1]), tags: tags, rule: rule, steps: [], examples: 0 };
+      tags = [];
+      f.scenarios.push(cur);
+      section = 'scenario';
+    } else if (/^Background:/.test(line)) {
+      cur = null;
+      section = 'background';
+    } else if ((m = /^Rule:\s*(.*)$/.exec(line))) {
+      rule = m[1];
+      cur = null;
+      section = 'rule';
+    } else if (/^(Examples|Scenarios):/.test(line)) {
+      section = 'examples';
+      header = true;
+    } else if (line.charAt(0) === '|') {
+      if (section === 'examples' && cur) {
+        if (header) header = false;
+        else cur.examples++;
+      }
+    } else if (/^(Given|When|Then|And|But|\*)\s/.test(line)) {
+      if (section === 'background') f.background.push(line);
+      else if (cur) cur.steps.push(line);
+    } else if (section === 'feature') f.description.push(line);
+  }
+  return f;
 }
 {
-  // tests written through page objects name no framework: attribute them when only one e2e tool is installed
-  const tools = ['cypress', 'playwright', 'protractor', 'webdriverio', 'testcafe'].filter(
-    (n) => declaredDeps[n] || (n === 'playwright' && declaredDeps['@playwright/test']) || (n === 'webdriverio' && declaredDeps['@wdio/cli'])
-  );
-  const other = e2e.byFramework.other;
-  if (other && tools.length === 1) {
-    const t = e2e.byFramework[tools[0]] || (e2e.byFramework[tools[0]] = { files: 0, cases: 0 });
-    t.files += other.files;
-    t.cases += other.cases;
-    delete e2e.byFramework.other;
+  const parsed = [];
+  const testFiles = new Set(found.e2e);
+  for (const abs of found.e2e.concat(found.e2eSupport)) {
+    const text = readText(abs);
+    const p = { abs: abs, rel: relOf(abs), text: text, isTest: testFiles.has(abs), framework: e2eFrameworkOf(text, abs), consts: new Map(), sf: null };
+    try {
+      p.sf = ts.createSourceFile(p.rel, text, ts.ScriptTarget.Latest, true, /\.(js|cjs|mjs)$/i.test(abs) ? ts.ScriptKind.JS : ts.ScriptKind.TS);
+      collectE2eConsts(p.sf, p.consts);
+    } catch (e) {
+      p.sf = null;
+    }
+    parsed.push(p);
+  }
+  {
+    // a spec that only calls page objects: take the tool its neighbours use, then the nearest package.json
+    const byHome = new Map();
+    for (const p of parsed) {
+      if (p.framework === 'other') continue;
+      const h = e2eHomeOf(p.rel);
+      if (!byHome.has(h)) byHome.set(h, new Set());
+      byHome.get(h).add(p.framework);
+    }
+    for (const p of parsed) {
+      if (p.framework !== 'other') continue;
+      const seen = byHome.get(e2eHomeOf(p.rel));
+      p.framework = (seen && seen.size === 1 && Array.from(seen)[0]) || nestedE2eTool(path.dirname(p.abs)) || singleE2eTool || 'other';
+    }
+  }
+  for (const p of parsed) {
+    let cases = -1;
+    if (p.sf) {
+      try {
+        cases = analyzeE2eFile(p);
+      } catch (e) {
+        cases = -1;
+      }
+    }
+    p.sf = null;
+    if (!p.isTest) continue;
+    if (cases < 0) {
+      // could not be read as code: fall back to counting test calls in the text
+      e2eStatic.parseErrors++;
+      cases = (p.text.match(TEST_CASE_RE) || []).length;
+    }
+    e2e.files++;
+    e2e.loc += nonBlank(p.text);
+    e2e.cases += cases;
+    if (!e2e.byFramework[p.framework]) e2e.byFramework[p.framework] = { files: 0, cases: 0 };
+    e2e.byFramework[p.framework].files++;
+    e2e.byFramework[p.framework].cases += cases;
+    const proj = projectOf(p.rel);
+    proj.e2eFiles++;
+    proj.e2eCases += cases;
   }
 }
 for (const abs of found.feature) {
   const text = readText(abs);
   e2e.featureFiles++;
   e2e.scenarios += (text.match(/^\s*(?:Scenario|Scenario Outline|Scenario Template|Example):/gm) || []).length;
+  e2eStatic.features.push(parseFeature(text, relOf(abs)));
 }
 
 const coverage = [];
@@ -1415,6 +2384,198 @@ if (!coverage.length) {
   }
 }
 
+/* ------------------------------------------------------------------ *
+ * Coverage reports, per file (unit tests, and an instrumented e2e run when there is one)
+ * ------------------------------------------------------------------ */
+function parseLcov(text) {
+  const out = [];
+  let cur = null;
+  let da = 0;
+  let daHit = 0;
+  for (const line of text.split(/\r?\n/)) {
+    if (line.startsWith('SF:')) {
+      cur = { path: line.slice(3).trim(), lf: -1, lh: -1, brf: 0, brh: 0, fnf: 0, fnh: 0 };
+      da = 0;
+      daHit = 0;
+    } else if (!cur) continue;
+    else if (line.startsWith('DA:')) {
+      da++;
+      if (parseInt(line.split(',')[1], 10) > 0) daHit++;
+    } else if (line.startsWith('LF:')) cur.lf = parseInt(line.slice(3), 10) || 0;
+    else if (line.startsWith('LH:')) cur.lh = parseInt(line.slice(3), 10) || 0;
+    else if (line.startsWith('BRF:')) cur.brf = parseInt(line.slice(4), 10) || 0;
+    else if (line.startsWith('BRH:')) cur.brh = parseInt(line.slice(4), 10) || 0;
+    else if (line.startsWith('FNF:')) cur.fnf = parseInt(line.slice(4), 10) || 0;
+    else if (line.startsWith('FNH:')) cur.fnh = parseInt(line.slice(4), 10) || 0;
+    else if (line.startsWith('end_of_record')) {
+      if (cur.lf < 0) cur.lf = da;
+      if (cur.lh < 0) cur.lh = daHit;
+      out.push(cur);
+      cur = null;
+    }
+  }
+  return out;
+}
+/** coverage-summary.json (json-summary reporter) or coverage-final.json (json reporter) */
+function parseCoverageJson(j) {
+  const out = [];
+  if (!j || typeof j !== 'object') return out;
+  for (const k of Object.keys(j)) {
+    const v = j[k];
+    if (k === 'total' || !v || typeof v !== 'object') continue;
+    if (v.lines && typeof v.lines.total === 'number') {
+      const g = (x) => (x && typeof x.total === 'number' ? x : { total: 0, covered: 0 });
+      out.push({ path: k, lf: v.lines.total, lh: v.lines.covered, brf: g(v.branches).total, brh: g(v.branches).covered, fnf: g(v.functions).total, fnh: g(v.functions).covered });
+    } else if (v.statementMap && v.s) {
+      // lines the way Istanbul counts them: a line is the start line of a statement, covered when any statement on it ran
+      const lines = new Map();
+      for (const id of Object.keys(v.statementMap)) {
+        const st = v.statementMap[id];
+        if (!st || !st.start || typeof st.start.line !== 'number') continue;
+        lines.set(st.start.line, (lines.get(st.start.line) || false) || v.s[id] > 0);
+      }
+      let lh = 0;
+      for (const hit of lines.values()) if (hit) lh++;
+      const fn = Object.keys(v.f || {});
+      let brf = 0;
+      let brh = 0;
+      for (const id of Object.keys(v.b || {})) {
+        for (const n of v.b[id] || []) {
+          brf++;
+          if (n > 0) brh++;
+        }
+      }
+      out.push({ path: v.path || k, lf: lines.size, lh: lh, brf: brf, brh: brh, fnf: fn.length, fnh: fn.filter((id) => v.f[id] > 0).length });
+    }
+  }
+  return out;
+}
+/** One directory page of the Istanbul HTML report: the default Angular setup writes nothing else. */
+function parseIstanbulHtml(file, baseDir) {
+  const text = readText(file);
+  const out = [];
+  if (text.indexOf('coverage-summary') === -1) return out;
+  const rowRe = /<td class="file[^"]*" data-value="([^"]*)">\s*<a href="([^"]*)">[\s\S]*?<\/tr>/g;
+  let m;
+  while ((m = rowRe.exec(text))) {
+    if (/(^|\/)index\.html$/.test(m[2])) continue; // a folder row, its own page lists the files
+    const abs = [];
+    const re = /class="abs[^"]*">\s*(\d+)\/(\d+)\s*<\/td>/g;
+    let a;
+    while ((a = re.exec(m[0]))) abs.push([parseInt(a[1], 10), parseInt(a[2], 10)]);
+    if (abs.length < 4) continue; // statements, branches, functions, lines
+    const name = m[1].replace(/&amp;/g, '&').replace(/&#x2F;/gi, '/').replace(/&quot;/g, '"');
+    out.push({ path: path.join(path.relative(baseDir, path.dirname(file)), name), lf: abs[3][1], lh: abs[3][0], brf: abs[1][1], brh: abs[1][0], fnf: abs[2][1], fnh: abs[2][0] });
+  }
+  return out;
+}
+const coverageByFile = { unit: new Map(), e2e: new Map() }; // absolute path of an application file -> { lf, lh, brf, brh, fnf, fnh }
+const coverageReports = []; // { path, format, kind, files, matched }
+{
+  // a report names files its own way (absolute path on the build machine, relative to a sub-project, ...): match by the end of the path
+  const byBase = new Map();
+  for (const f of fileRecs.keys()) {
+    const b = path.basename(f);
+    if (!byBase.has(b)) byBase.set(b, []);
+    byBase.get(b).push({ abs: f, segs: toPosix(f).split('/') });
+  }
+  const mapPath = (p) => {
+    const segs = String(p).replace(/\\/g, '/').split('/').filter((s) => s && s !== '.');
+    const cands = byBase.get(segs[segs.length - 1]);
+    if (!cands) return null;
+    let best = null;
+    let bestN = 0;
+    let tie = false;
+    for (const c of cands) {
+      let n = 0;
+      while (n < segs.length && n < c.segs.length && segs[segs.length - 1 - n] === c.segs[c.segs.length - 1 - n]) n++;
+      if (n > bestN) {
+        best = c;
+        bestN = n;
+        tie = false;
+      } else if (n === bestN) tie = true;
+    }
+    if (!best || tie) return null;
+    return bestN >= 2 || cands.length === 1 ? best.abs : null;
+  };
+  const kindOf = (file, forced) => forced || (relOf(file).split('/').some((s) => E2E_DIR_RE.test(s)) ? 'e2e' : 'unit');
+  const seenFiles = new Set();
+  const load = (file, format, kind, baseDir) => {
+    if (seenFiles.has(file)) return;
+    seenFiles.add(file);
+    let entries = [];
+    try {
+      if (format === 'lcov') entries = parseLcov(readText(file));
+      else if (format === 'json') entries = parseCoverageJson(readJsonLoose(file));
+      else entries = parseIstanbulHtml(file, baseDir);
+    } catch (e) {
+      entries = [];
+    }
+    if (!entries.length) return;
+    const into = coverageByFile[kind];
+    let matched = 0;
+    for (const en of entries) {
+      const abs = mapPath(en.path);
+      if (!abs) continue;
+      matched++;
+      const prev = into.get(abs);
+      if (!prev || en.lh > prev.lh || (en.lh === prev.lh && en.lf > prev.lf)) into.set(abs, en);
+    }
+    let rep = coverageReports.find((r) => r.format === 'html' && format === 'html' && r.base === baseDir && r.kind === kind);
+    if (!rep) coverageReports.push((rep = { path: relOf(format === 'html' ? baseDir : file), format: format, kind: kind, files: 0, matched: 0, base: baseDir }));
+    rep.files += entries.length;
+    rep.matched += matched;
+  };
+  const scanDir = (dir, forced) => {
+    const data = [];
+    const html = [];
+    (function walkCov(d, depth) {
+      let entries;
+      try {
+        entries = fs.readdirSync(d, { withFileTypes: true });
+      } catch (e) {
+        return;
+      }
+      for (const e of entries) {
+        const full = path.join(d, e.name);
+        if (e.isDirectory()) {
+          if (depth < 12 && e.name !== 'node_modules') walkCov(full, depth + 1);
+        } else if (e.name === 'lcov.info') data.push([full, 'lcov']);
+        else if (e.name === 'coverage-final.json' || e.name === 'coverage-summary.json') data.push([full, 'json']);
+        else if (e.name === 'index.html') html.push(full);
+      }
+    })(dir, 0);
+    const kindsWithData = new Set();
+    for (const d of data) {
+      const kind = kindOf(d[0], forced);
+      kindsWithData.add(kind);
+      load(d[0], d[1], kind, dir);
+    }
+    // the HTML pages repeat what lcov and JSON say: read them only when nothing else is there
+    for (const h of html) {
+      const kind = kindOf(h, forced);
+      if (!kindsWithData.has(kind)) load(h, 'html', kind, dir);
+    }
+  };
+  const scanPath = (p, forced) => {
+    let st;
+    try {
+      st = fs.statSync(p);
+    } catch (e) {
+      process.stderr.write('Coverage path not found: ' + p + '\n');
+      return;
+    }
+    if (st.isDirectory()) scanDir(p, forced);
+    else if (/\.json$/i.test(p)) load(p, 'json', forced || 'unit', path.dirname(p));
+    else if (/\.html?$/i.test(p)) scanDir(path.dirname(p), forced);
+    else load(p, 'lcov', forced || 'unit', path.dirname(p));
+  };
+  for (const d of coverageDirs) scanPath(d, null);
+  for (const p of opts.coverage) scanPath(path.resolve(p), 'unit');
+  for (const p of opts.e2eCoverage) scanPath(path.resolve(p), 'e2e');
+  for (const r of coverageReports) delete r.base;
+}
+
 const graphql = { files: 0, operations: { query: 0, mutation: 0, subscription: 0, fragment: 0 }, schemaDefinitions: 0, documentsInTs: agg.gql.documents, operationsInTs: agg.gql.operations, callSites: 0 };
 const seenGraphql = new Set();
 for (const abs of found.graphql) {
@@ -1423,6 +2584,7 @@ for (const abs of found.graphql) {
   const digest = require('crypto').createHash('sha1').update(text).digest('hex');
   if (seenGraphql.has(digest)) continue;
   seenGraphql.add(digest);
+  if (inAppFolders(abs)) collectGqlOps(text, abs);
   graphql.files++;
   const re = /^\s*(query|mutation|subscription|fragment)\b/gm;
   let m;
@@ -1451,6 +2613,455 @@ for (const abs of found.mfConfig) {
       if (arr) agg.mf[key] += (arr[1].match(/['"][^'"]+['"]/g) || []).length;
     }
   }
+}
+
+/* ------------------------------------------------------------------ *
+ * Tests against the application: which screens and components leave a trace in the e2e code,
+ * which files the unit tests cover, and where neither is the case
+ * ------------------------------------------------------------------ */
+const testGaps = {};
+/** '/payments/42?tab=1', 'http://host/#/payments', `${base}/payments` -> ['payments', '42']; null when nothing of it is known */
+function urlToSegs(raw) {
+  let s = String(raw).trim();
+  if (/^\*+$/.test(s)) return null; // built at run time: nothing to match
+  s = s.replace(/^\*+(?=[\/#?]|$)/, '').replace(/^[a-z][a-z0-9+.\-]*:\/\/[^\/?#]*/i, '');
+  const hash = s.indexOf('#/');
+  if (hash !== -1) s = s.slice(hash + 1);
+  s = s.replace(/[?#].*$/, '');
+  return s.split('/').filter(Boolean).map((x) => (x.indexOf('*') !== -1 ? '*' : x));
+}
+{
+  // --- URLs from the e2e code against the route tree
+  const LEVEL = { '': 0, shared: 1, element: 2, ran: 3, asserted: 4, visited: 5 };
+  // a parameter of the route takes any segment; a part of the URL that is unknown only fits a parameter
+  const segFits = (r, u) => (r.charAt(0) === ':' ? 1 : r === u && u !== '*' ? 3 : 0);
+  const matchExact = (segs) => {
+    let best = -1;
+    let hits = [];
+    for (const e of routeList) {
+      const rs = e.segs;
+      if (rs.length !== segs.length || (rs.length && rs[rs.length - 1] === '**')) continue;
+      let score = 0;
+      let ok = true;
+      for (let i = 0; i < rs.length && ok; i++) {
+        const f = segFits(rs[i], segs[i]);
+        if (!f) ok = false;
+        score += f;
+      }
+      if (!ok) continue;
+      if (score > best) {
+        best = score;
+        hits = [e];
+      } else if (score === best) hits.push(e);
+    }
+    return hits;
+  };
+  // "URL includes /payments": the shortest routes that contain these segments in a row
+  const matchPartial = (segs) => {
+    if (!segs.length) return [];
+    let hits = [];
+    let len = Infinity;
+    for (const e of routeList) {
+      const rs = e.segs;
+      let found = false;
+      for (let at = 0; at + segs.length <= rs.length && !found; at++) {
+        found = true;
+        for (let i = 0; i < segs.length && found; i++) if (!segFits(rs[at + i], segs[i])) found = false;
+      }
+      if (!found) continue;
+      if (rs.length < len) {
+        len = rs.length;
+        hits = [e];
+      } else if (rs.length === len) hits.push(e);
+    }
+    return hits;
+  };
+  const credit = (e, level, depth) => {
+    if (e.node.isRedirect && typeof e.node.redirectTo === 'string' && depth < 4) {
+      const base = e.node.redirectTo.charAt(0) === '/' || !e.parent ? [] : e.parent.segs;
+      for (const h of matchExact(base.concat(e.node.redirectTo.split('/').filter(Boolean)))) if (h !== e) credit(h, level, depth + 1);
+    }
+    // everything above a route is on screen with it
+    for (let x = e; x; x = x.parent) if (LEVEL[level] > LEVEL[x.e2e]) x.e2e = level;
+  };
+  const nav = { resolved: 0, unresolved: 0, matched: 0, unmatched: {}, visits: 0, assertions: 0 };
+  for (const n of e2eStatic.navs) {
+    if (n.kind === 'visit') nav.visits++;
+    else nav.assertions++;
+    const segs = urlToSegs(n.raw);
+    if (!segs || (segs.length && segs.every((s) => s === '*'))) {
+      nav.unresolved++;
+      continue;
+    }
+    nav.resolved++;
+    if (!routeList.length) continue;
+    let hits = n.partial ? matchPartial(segs) : matchExact(segs);
+    // the application may be served under a base path: /tfc/payments
+    if (!hits.length && !n.partial && segs.length > 1) hits = matchExact(segs.slice(1));
+    if (!hits.length) {
+      bump(nav.unmatched, '/' + segs.join('/'));
+      continue;
+    }
+    nav.matched++;
+    for (const h of hits) credit(h, n.kind === 'visit' ? 'visited' : 'asserted', 0);
+  }
+
+  // --- components: test ids and selectors named in the e2e code
+  const blob = '\u0000' + Array.from(e2eStatic.literals).join('\u0000') + '\u0000';
+  const idCache = new Map();
+  const affixes = Array.from(e2eStatic.affixes.values());
+  // 'literal': the id is written out in the test code. 'composed': a helper builds ids of this shape and the missing half is a literal in the tests.
+  const idHow = (id) => {
+    if (!idCache.has(id)) {
+      let how = '';
+      if (blob.indexOf('\u0000' + id + '\u0000') !== -1 || blob.indexOf('="' + id + '"') !== -1 || blob.indexOf("='" + id + "'") !== -1 || blob.indexOf('=' + id + ']') !== -1) how = 'literal';
+      else if (affixes.some((x) => id.length > x.a.length + x.b.length && id.startsWith(x.a) && id.endsWith(x.b) && e2eStatic.literals.has(id.slice(x.a.length, id.length - x.b.length)))) how = 'composed';
+      idCache.set(id, how);
+    }
+    return idCache.get(id);
+  };
+  const idInE2e = (id) => !!idHow(id);
+  const elementSelectors = (sel) => {
+    const out = [];
+    for (const part of String(sel || '').split(',')) {
+      const m = /^\s*([a-z][a-z0-9]*(?:-[a-z0-9]+)+)(?=$|[\s\[.:])/i.exec(part);
+      if (m) out.push(m[1].toLowerCase());
+    }
+    return out;
+  };
+  const bySelector = new Map();
+  for (const c of components) {
+    c.sels = elementSelectors(c.selector);
+    for (const s of c.sels) {
+      if (!bySelector.has(s)) bySelector.set(s, []);
+      bySelector.get(s).push(c);
+    }
+  }
+  // ids, names and form control names that the tests select by: '#save', 'form#login', '[name="q"]', '[formcontrolname=amount]'
+  const hooksInTests = e2eStatic.hooks;
+  const lookups = { testId: 0, tag: 0, handle: 0, cssClass: 0, otherAttribute: 0, attributes: {} };
+  {
+    const testIdSel = new RegExp('\\[\\s*(?:' + TEST_ID_ATTRS + extraTestIdAttrs.map((a) => '|' + a.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('') + ')\\s*[~|^$*]?[=\\]]', 'i');
+    const idRe = /(?:^|[\s>+~,(]|\b[a-z][a-z0-9-]*)#([A-Za-z_][\w-]*)/g;
+    const attrRe = /\[\s*([A-Za-z][\w-]*)\s*(?:[~|^$*]?=\s*["']?([^"'\]\s]*)["']?\s*)?\]/g;
+    for (const lit of e2eStatic.literals) {
+      if (lit.length > 300 || /^\s*[{<]/.test(lit)) continue; // JSON, markup
+      const isUrl = lit.indexOf('://') !== -1 || lit.charAt(0) === '/';
+      let m;
+      let kinds = 0;
+      if (lit.indexOf('#') !== -1 && !isUrl) {
+        idRe.lastIndex = 0;
+        while ((m = idRe.exec(lit))) {
+          hooksInTests.add('id=' + m[1]);
+          kinds |= 1;
+        }
+      }
+      if (lit.indexOf('[') !== -1) {
+        if (testIdSel.test(lit)) kinds |= 2;
+        attrRe.lastIndex = 0;
+        while ((m = attrRe.exec(lit))) {
+          const a = m[1].toLowerCase();
+          if (HOOK_KIND[a] && m[2]) hooksInTests.add(HOOK_KIND[a] + '=' + m[2]);
+          if (HOOK_KIND[a]) kinds |= 1;
+          else if (!testIdSel.test('[' + a + ']')) {
+            kinds |= 4;
+            bump(lookups.attributes, a);
+          }
+        }
+      }
+      if (!isUrl && lit.indexOf('/') === -1 && /(?:^|[\s>+~,(])\.[A-Za-z_][\w-]*/.test(lit)) kinds |= 8;
+      const tag = /^([a-z][a-z0-9]*(?:-[a-z0-9]+)+)(?=$|[\s\[.:>#,])/.exec(lit);
+      if (tag && bySelector.has(tag[1])) kinds |= 16; // a selector of one of the application's own components
+      if (kinds & 1) lookups.handle++;
+      if (kinds & 2) lookups.testId++;
+      if (kinds & 4) lookups.otherAttribute++;
+      if (kinds & 8) lookups.cssClass++;
+      if (kinds & 16) lookups.tag++;
+    }
+  }
+  const hasE2e = e2eStatic.literals.size > 0;
+  const idOwners = new Map();
+  for (const c of components) for (const id of c.testIdList) idOwners.set(id, (idOwners.get(id) || 0) + 1);
+  const hookOwners = new Map();
+  for (const c of components) for (const h of c.hookList) hookOwners.set(h, (hookOwners.get(h) || 0) + 1);
+  for (const c of components) {
+    c.testIds = c.testIdList.length;
+    c.testIdsInE2e = hasE2e ? c.testIdList.filter((id) => idOwners.get(id) === 1 && idInE2e(id)).length : 0;
+    c.sharedIdsInE2e = hasE2e ? c.testIdList.filter((id) => idOwners.get(id) > 1 && idOwners.get(id) <= SHARED_MAX && idInE2e(id)).length : 0;
+    c.hooksInE2e = hasE2e ? c.hookList.filter((h) => hookOwners.get(h) === 1 && hooksInTests.has(h)).length : 0;
+    c.sharedIdsInE2e += hasE2e ? c.hookList.filter((h) => hookOwners.get(h) > 1 && hookOwners.get(h) <= SHARED_MAX && hooksInTests.has(h)).length : 0;
+    c.e2eRoute = '';
+    // the root component is on screen whenever a test opens anything at all
+    c.e2eRoot = bootstrapNames.has(c.name) && nav.visits > 0;
+    c.e2eSelector = hasE2e && c.sels.some((s) => new RegExp('(^|[^\\w-])' + s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '($|[^\\w-])').test(blob));
+    c.onScreen = false;
+  }
+  for (const e of routeList) for (const c of e.comps) if (LEVEL[e.e2e] > LEVEL[c.e2eRoute]) c.e2eRoute = e.e2e;
+
+  // an instrumented e2e run, when a report of one was read: did code of the file run? A file that was only loaded has
+  // lines that ran but no function that did, so functions decide wherever the report counts them.
+  const linePct = (r) => (r && r.lf ? Math.round((r.lh / r.lf) * 100) : '');
+  const e2eRep = coverageByFile.e2e.size > 0;
+  let e2eHasFunctions = false;
+  for (const r of coverageByFile.e2e.values()) if (r.fnf > 0) e2eHasFunctions = true;
+  for (const x of components.concat(classes)) {
+    const er = coverageByFile.e2e.get(x.abs);
+    x.e2eLinePct = linePct(er);
+    x.e2eRan = !!er && (e2eHasFunctions ? er.fnh > 0 : er.lh > 0);
+  }
+
+  // --- who can put a component on screen: its routes, and the components that use its tag or name it in their class
+  const hostsOf = new Map();
+  const routesOf = new Map();
+  const link = (map, k, v) => {
+    if (!map.has(k)) map.set(k, new Set());
+    map.get(k).add(v);
+  };
+  for (const h of components) {
+    for (const tag of h.tagList) for (const x of bySelector.get(tag) || []) if (x !== h) link(hostsOf, x, h);
+    for (const r of h.refs) for (const x of compByName.get(r) || []) if (x !== h) link(hostsOf, x, h);
+  }
+  for (const e of routeList) for (const c of e.comps) link(routesOf, c, e);
+  // a service, guard or directive that names a component may open or create it, and nothing here can follow that
+  const namedElsewhere = new Set();
+  for (const k of classes) if (k.kind !== 'module') for (const r of k.refs || []) for (const x of compByName.get(r) || []) namedElsewhere.add(x);
+
+  // A component with marks of its own (a test id only it has, its selector, code that ran) was on screen in some test.
+  // So was whatever alone can put it there: its routes, or, without a route, its one host. With two or three candidates
+  // the trace cannot say which of them it was, and they get the weaker "shared" mark. With more than that (a widget
+  // that sits on every other screen) it says next to nothing about any one of them, and is not passed on at all.
+  const ownMark = (c) => (c.e2eRan ? 'ran' : c.testIdsInE2e || c.e2eSelector || c.hooksInE2e ? 'element' : '');
+  const certain = (c) => !!(c.e2eRoute || c.e2eRoot || c.e2eHost || ownMark(c));
+  const creditRoutes = (c, level) => {
+    for (const e of routesOf.get(c) || []) for (let x = e; x; x = x.parent) if (LEVEL[level] > LEVEL[x.e2e]) x.e2e = level;
+  };
+  const up = components.filter(ownMark).map((c) => ({ c: c, level: ownMark(c) }));
+  const undecided = components.filter((c) => c.sharedIdsInE2e);
+  while (up.length) {
+    const it = up.pop();
+    const hosts = Array.from(hostsOf.get(it.c) || []);
+    if (routesOf.has(it.c)) {
+      creditRoutes(it.c, it.level);
+      if (hosts.length <= SHARED_MAX) for (const h of hosts) undecided.push(h);
+    } else if (hosts.length === 1 && !namedElsewhere.has(it.c)) {
+      if (!certain(hosts[0])) {
+        hosts[0].e2eHost = true;
+        up.push({ c: hosts[0], level: it.level });
+      }
+    } else if (hosts.length <= SHARED_MAX) for (const h of hosts) undecided.push(h);
+  }
+  // a screen that is reached takes the routes above it along: their components hold the outlet it sits in
+  for (const e of routeList) if (e.e2e === 'element' || e.e2e === 'ran') for (const c of e.comps) if (!certain(c)) c.e2eHost = true;
+  const seenUndecided = new Set();
+  while (undecided.length) {
+    const c = undecided.pop();
+    if (seenUndecided.has(c) || certain(c)) continue;
+    seenUndecided.add(c);
+    c.e2eShared = true;
+    creditRoutes(c, 'shared');
+    const hosts = hostsOf.get(c);
+    if (hosts && hosts.size <= SHARED_MAX) for (const h of hosts) undecided.push(h);
+  }
+  // the same component under another path that the tests do reach: the component is covered, this path may not be
+  for (const e of routeList) if (!e.e2e && e.comps.some(certain)) for (let x = e; x; x = x.parent) if (!x.e2e) x.e2e = 'shared';
+  for (const e of routeList) if (e.e2e === 'shared') for (const c of e.comps) if (!certain(c)) c.e2eShared = true;
+
+  // --- what a reached component puts on screen: tags in its template, components its class opens or creates
+  const queue = components.filter(certain);
+  const seen = new Set(queue);
+  while (queue.length) {
+    const c = queue.pop();
+    const next = [];
+    for (const tag of c.tagList) for (const k of bySelector.get(tag) || []) next.push(k);
+    for (const r of c.refs) if (r !== c.name) for (const k of compByName.get(r) || []) next.push(k);
+    for (const k of next) {
+      if (seen.has(k)) continue;
+      seen.add(k);
+      k.onScreen = true;
+      queue.push(k);
+    }
+  }
+  const unitRep = coverageByFile.unit.size > 0;
+  const unitOf = (x) => {
+    const r = coverageByFile.unit.get(x.abs);
+    if (!unitRep) return x.specCases > 0 ? 'spec' : 'none';
+    if (!r) return 'absent';
+    if (!r.lf) return 'n/a';
+    const p = (r.lh / r.lf) * 100;
+    return p >= UNIT_OK_PCT ? 'covered' : p > 0 ? 'partial' : 'zero';
+  };
+  for (const x of components.concat(classes)) {
+    x.unitLinePct = linePct(coverageByFile.unit.get(x.abs));
+    x.unit = unitOf(x);
+    x.unitOk = x.unit === 'covered' || x.unit === 'spec';
+  }
+  for (const c of components) {
+    const parts = [];
+    if (c.e2eRan) parts.push('ran');
+    if (c.e2eRoot) parts.push('root');
+    if (c.e2eRoute) parts.push('route');
+    if (c.testIdsInE2e) parts.push('testid');
+    if (c.e2eSelector) parts.push('selector');
+    if (c.hooksInE2e) parts.push('attr');
+    if (c.e2eHost) parts.push('host');
+    // weaker evidence, in this order: sits on a screen the tests reach; carries a test id the tests use, but shares it with
+    // other components; is one of several that could have put a traced component on screen
+    c.e2e = parts.join('+') || (c.onScreen ? 'screen' : c.sharedIdsInE2e ? 'shared-id' : c.e2eShared ? 'shared-host' : '');
+    c.e2eLevel = parts.length ? 'direct' : c.onScreen || c.sharedIdsInE2e || c.e2eShared ? 'indirect' : 'none';
+  }
+
+  // --- numbers
+  const screens = routeList.filter(isScreen);
+  const tests = e2eStatic.tests;
+  const words = tests.map((t) => t.title.split(/\s+/).filter(Boolean).length).sort((a, b) => a - b);
+  const opNames = Array.from(gqlOps.values());
+  for (const o of opNames) o.inE2e = hasE2e && (blob.indexOf('\u0000' + o.name + '\u0000') !== -1 || blob.indexOf(o.type + ' ' + o.name) !== -1 || blob.indexOf('"' + o.name + '"') !== -1);
+  const allIds = new Set();
+  for (const c of components) for (const id of c.testIdList) allIds.add(id);
+
+  // unit coverage: the report only lists files that a test loaded, so the files it leaves out have to be added back
+  let lf = 0;
+  let lh = 0;
+  let locInReport = 0;
+  let absentFiles = 0;
+  let absentLoc = 0;
+  let runtimeFiles = 0;
+  let inReport = 0;
+  const tot = { brf: 0, brh: 0, fnf: 0, fnh: 0 };
+  for (const [f, r] of fileRecs) {
+    const cv = coverageByFile.unit.get(f);
+    if (r.runtime) runtimeFiles++;
+    if (cv) {
+      inReport++;
+      lf += cv.lf;
+      lh += cv.lh;
+      locInReport += r.loc;
+      for (const k of Object.keys(tot)) tot[k] += cv[k];
+    } else if (r.runtime) {
+      absentFiles++;
+      absentLoc += r.loc;
+    }
+  }
+  const estAbsent = locInReport ? Math.round((absentLoc * lf) / locInReport) : 0;
+  const group = (list) => {
+    const withCov = list.filter((x) => coverageByFile.unit.has(x.abs));
+    const f = sum(withCov, (x) => coverageByFile.unit.get(x.abs).lf);
+    const h = sum(withCov, (x) => coverageByFile.unit.get(x.abs).lh);
+    return {
+      count: list.length, inReport: withCov.length, linesFound: f, linesHit: h, linePct: f ? Math.round((h / f) * 100) : null,
+      none: list.filter((x) => x.unit === 'absent' || x.unit === 'zero' || x.unit === 'none').length,
+      partial: list.filter((x) => x.unit === 'partial').length,
+      ok: list.filter((x) => x.unitOk).length,
+    };
+  };
+  const byKind = {};
+  for (const b of BUCKETS) byKind['components' + b] = group(components.filter((c) => c.bucket === b));
+  byKind.services = group(classes.filter((c) => c.kind === 'service'));
+  byKind.guardsInterceptorsResolvers = group(classes.filter((c) => c.kind === 'guard' || c.kind === 'interceptor' || c.kind === 'resolver'));
+  byKind.effectsAndStores = group(classes.filter((c) => c.kind === 'effects' || c.kind === 'store'));
+  byKind.directives = group(classes.filter((c) => c.kind === 'directive'));
+  byKind.pipes = group(classes.filter((c) => c.kind === 'pipe'));
+  const matrix = {};
+  const e2eByBucket = {};
+  for (const b of BUCKETS) {
+    const list = components.filter((c) => c.bucket === b);
+    const e2eAny = (c) => c.e2eLevel !== 'none';
+    matrix[b] = {
+      count: list.length,
+      both: list.filter((c) => c.unitOk && e2eAny(c)).length,
+      unitOnly: list.filter((c) => c.unitOk && !e2eAny(c)).length,
+      e2eOnly: list.filter((c) => !c.unitOk && e2eAny(c)).length,
+      neither: list.filter((c) => !c.unitOk && !e2eAny(c)).length,
+      // part of e2eOnly: no unit tests, and the e2e trace is an indirect one only
+      indirectOnly: list.filter((c) => !c.unitOk && c.e2eLevel === 'indirect').length,
+    };
+    e2eByBucket[b] = {
+      count: list.length,
+      direct: list.filter((c) => c.e2eLevel === 'direct').length,
+      indirect: list.filter((c) => c.e2eLevel === 'indirect').length,
+      none: list.filter((c) => c.e2eLevel === 'none').length,
+    };
+  }
+  const noCheck = tests.filter((t) => (t.status === 'active' || t.status === 'only') && t.checks === 0);
+  Object.assign(testGaps, {
+    unitCoverage: {
+      reportFound: unitRep,
+      reports: coverageReports.filter((r) => r.kind === 'unit').length,
+      formats: Array.from(new Set(coverageReports.filter((r) => r.kind === 'unit').map((r) => r.format))),
+      applicationFilesWithCode: runtimeFiles,
+      filesInReport: inReport,
+      lines: { found: lf, hit: lh, pct: lf ? Math.round((lh / lf) * 1000) / 10 : null },
+      branches: { found: tot.brf, hit: tot.brh, pct: tot.brf ? Math.round((tot.brh / tot.brf) * 1000) / 10 : null },
+      functions: { found: tot.fnf, hit: tot.fnh, pct: tot.fnf ? Math.round((tot.fnh / tot.fnf) * 1000) / 10 : null },
+      absentFromReport: { files: absentFiles, loc: absentLoc, estimatedLines: estAbsent },
+      adjustedLinePct: lf + estAbsent ? Math.round((lh / (lf + estAbsent)) * 1000) / 10 : null,
+      okThresholdPct: UNIT_OK_PCT,
+      byKind: byKind,
+    },
+    e2e: {
+      tests: {
+        total: tests.length,
+        active: tests.filter((t) => t.status === 'active').length,
+        skipped: tests.filter((t) => t.status === 'skipped').length,
+        pending: tests.filter((t) => t.status === 'pending').length,
+        only: tests.filter((t) => t.status === 'only').length,
+        parameterised: tests.filter((t) => t.each).length,
+        withSteps: tests.filter((t) => t.steps.length).length,
+        steps: sum(tests, (t) => t.steps.length),
+        noExplicitCheck: noCheck.length,
+        noCheckAndNoAction: noCheck.filter((t) => t.actions === 0).length,
+      },
+      titles: { medianWords: words.length ? words[Math.floor((words.length - 1) / 2)] : null, shorterThan3Words: words.filter((w) => w < 3).length },
+      gherkin: { features: e2eStatic.features.length, scenarios: sum(e2eStatic.features, (f) => f.scenarios.length), steps: sum(e2eStatic.features, (f) => sum(f.scenarios, (s) => s.steps.length)), stepDefinitions: e2eStatic.stepDefs },
+      networkStubs: e2eStatic.stubs,
+      navigation: { visits: nav.visits, urlAssertions: nav.assertions, resolved: nav.resolved, builtAtRunTime: nav.unresolved, matchedARoute: nav.matched, matchedNoRoute: sum(Object.keys(nav.unmatched), (k) => nav.unmatched[k]) },
+      routes: { total: routeList.length, unresolvedPaths: routeNotes.unresolvedPaths, lazyNotFollowed: routeNotes.unresolvedLazy, remote: routeNotes.remote, notMounted: routeNotes.unmounted },
+      screens: {
+        total: screens.length,
+        visited: screens.filter((e) => e.e2e === 'visited').length,
+        asserted: screens.filter((e) => e.e2e === 'asserted').length,
+        ran: screens.filter((e) => e.e2e === 'ran').length,
+        byElement: screens.filter((e) => e.e2e === 'element').length,
+        undecided: screens.filter((e) => e.e2e === 'shared').length,
+        noTrace: screens.filter((e) => !e.e2e).length,
+      },
+      components: e2eByBucket,
+      testIds: {
+        inTemplates: allIds.size, sharedByComponents: Array.from(allIds).filter((id) => idOwners.get(id) > 1).length,
+        namedInE2e: hasE2e ? Array.from(allIds).filter(idInE2e).length : 0,
+        composedInE2e: hasE2e ? Array.from(allIds).filter((id) => idHow(id) === 'composed').length : 0,
+        attributes: Object.keys(testIdAttrUse).sort((a, b) => testIdAttrUse[b] - testIdAttrUse[a]).map((a) => ({ name: a, count: testIdAttrUse[a] })),
+        attributesTakenFromTheTests: extraTestIdAttrs,
+      },
+      // element ids, name attributes and form control names: weaker than a test id, but tests select by them too
+      otherHandles: {
+        inTemplates: hookOwners.size,
+        sharedByComponents: Array.from(hookOwners.values()).filter((n) => n > 1).length,
+        namedInE2e: hasE2e ? Array.from(hookOwners.keys()).filter((h) => hooksInTests.has(h)).length : 0,
+      },
+      lookups: {
+        distinctSelectors: { byTestIdAttribute: lookups.testId, byComponentTag: lookups.tag, byIdNameOrFormControl: lookups.handle, byCssClass: lookups.cssClass, byOtherAttribute: lookups.otherAttribute },
+        otherAttributes: topN(lookups.attributes, 8),
+        callsThroughATestIdHelper: e2eStatic.lookups.testIdCalls,
+        callsByTextRoleOrLabel: e2eStatic.lookups.textCalls,
+      },
+      graphqlOperations: { named: opNames.length, anonymous: gqlAnonymous.count, namedInE2e: opNames.filter((o) => o.inE2e).length },
+      filesNotReadAsCode: e2eStatic.parseErrors,
+    },
+    e2eCoverage: e2eRep
+      ? (() => {
+          let f = 0;
+          let h = 0;
+          for (const r of coverageByFile.e2e.values()) {
+            f += r.lf;
+            h += r.lh;
+          }
+          return { filesInReport: coverageByFile.e2e.size, lines: { found: f, hit: h, pct: f ? Math.round((h / f) * 1000) / 10 : null }, countsFunctions: e2eHasFunctions, componentsRun: components.filter((c) => c.e2eRan).length };
+        })()
+      : null,
+    matrix: matrix,
+  });
+  testGaps.unmatchedUrls = nav.unmatched; // names: kept out of summary.json
 }
 
 /* ------------------------------------------------------------------ *
@@ -1487,12 +3098,6 @@ const injectableKinds = ['service', 'guard', 'interceptor', 'resolver', 'effects
 const flagCount = (k) => components.filter((c) => c[k]).length;
 const reasonCounts = {};
 for (const c of components) for (const r of c.reasons ? c.reasons.split('+') : []) bump(reasonCounts, r);
-const topN = (obj, n) =>
-  Object.keys(obj)
-    .map((k) => ({ name: k, count: obj[k] }))
-    .sort((a, b) => b.count - a.count || (a.name < b.name ? -1 : 1))
-    .slice(0, n);
-
 const byBucket = {};
 const bySizeOnly = {};
 for (const b of BUCKETS) {
@@ -1650,6 +3255,10 @@ const summary = {
     e2eCases: e2e.cases + e2e.scenarios,
     graphqlCallSites: graphql.callSites,
   };
+  const g = Object.assign({}, testGaps);
+  delete g.unmatchedUrls;
+  summary.testGaps = g;
+  summary.tests.coverageReports = coverageReports.map((r) => ({ path: anon ? undefined : r.path, format: r.format, kind: r.kind, files: r.files, matchedToApplicationFiles: r.matched }));
 }
 summary.environment.durationMs = Date.now() - started;
 
@@ -1682,8 +3291,29 @@ const outClasses = classes.map((c) =>
     specCases: c.specCases < 0 ? '' : c.specCases,
   })
 );
-const COMPONENT_COLS = ['project', 'file', 'name', 'selector', 'bucket', 'sizeBucket', 'points', 'reasons', 'routed', 'standalone', 'onPush', 'inlineTemplate', 'totalLoc', 'classLoc', 'tplLoc', 'styleLoc', 'deps', 'inputs', 'outputs', 'queries', 'hostBindings', 'methods', 'hooks', 'subscribes', 'rxPipes', 'signals', 'effects', 'manualCd', 'dispatches', 'navigations', 'httpCalls', 'gqlCalls', 'formControls', 'tplFormBindings', 'ngModel', 'ctrlFlow', 'bindings', 'interpolations', 'childTags', 'ngContent', 'ngTemplate', 'templateOutlet', 'tplPipes', 'cva', 'validator', 'dynamic', 'directDom', 'inheritance', 'animations', 'ownProviders', 'specCases'];
-const CLASS_COLS = ['project', 'file', 'kind', 'name', 'loc', 'deps', 'methods', 'subscribes', 'rxPipes', 'httpCalls', 'gqlCalls', 'subjects', 'signals', 'dispatches', 'inputs', 'outputs', 'hostListeners', 'detail', 'specCases'];
+const COMPONENT_COLS = ['project', 'file', 'name', 'selector', 'bucket', 'sizeBucket', 'points', 'reasons', 'routed', 'standalone', 'onPush', 'inlineTemplate', 'totalLoc', 'classLoc', 'tplLoc', 'styleLoc', 'deps', 'inputs', 'outputs', 'queries', 'hostBindings', 'methods', 'hooks', 'subscribes', 'rxPipes', 'signals', 'effects', 'manualCd', 'dispatches', 'navigations', 'httpCalls', 'gqlCalls', 'formControls', 'tplFormBindings', 'ngModel', 'ctrlFlow', 'bindings', 'interpolations', 'childTags', 'ngContent', 'ngTemplate', 'templateOutlet', 'tplPipes', 'cva', 'validator', 'dynamic', 'directDom', 'inheritance', 'animations', 'ownProviders', 'specCases', 'unit', 'unitLinePct', 'e2e', 'testIds', 'testIdsInE2e', 'e2eLinePct'];
+const CLASS_COLS = ['project', 'file', 'kind', 'name', 'loc', 'deps', 'methods', 'subscribes', 'rxPipes', 'httpCalls', 'gqlCalls', 'subjects', 'signals', 'dispatches', 'inputs', 'outputs', 'hostListeners', 'detail', 'specCases', 'unit', 'unitLinePct', 'e2eLinePct'];
+const ROUTE_COLS = ['project', 'path', 'kind', 'component', 'guarded', 'e2e', 'unit', 'sourceFile'];
+const E2E_TEST_COLS = ['file', 'framework', 'suite', 'title', 'status', 'parameterised', 'steps', 'actions', 'checks', 'visits'];
+const OPERATION_COLS = ['type', 'name', 'file', 'namedInE2e'];
+const routeKind = (e) => (e.node.isRedirect ? 'redirect' : e.node.outlet ? 'outlet' : isScreen(e) ? (e.node.lazyComponent ? 'lazy screen' : 'screen') : e.node.remote ? 'remote' : e.node.lazy ? 'lazy group' : 'group');
+const outRoutes = routeList.map((e) => ({
+  project: anonId('project', e.node.project),
+  path: anon ? anonId('route', e.path) : e.path,
+  kind: routeKind(e),
+  component: e.comps.length ? displayName('component', e.comps[0]) : anon ? '' : e.node.component,
+  guarded: e.node.guarded,
+  e2e: e.e2e,
+  unit: e.comps.length ? e.comps[0].unit : '',
+  sourceFile: anonId('file', relOf(e.node.file)),
+}));
+const outE2eTests = e2eStatic.tests.map((t) => ({
+  file: anonId('e2e-file', t.file), framework: t.framework, suite: anon ? '' : t.suite.join(' > '), title: anon ? '' : t.title, status: t.status,
+  parameterised: t.each, steps: t.steps.length, actions: t.actions, checks: t.checks, visits: anon ? t.visits.length : t.visits.join(' '),
+}));
+const outOperations = Array.from(gqlOps.values())
+  .sort((a, b) => (a.type < b.type ? -1 : a.type > b.type ? 1 : a.name < b.name ? -1 : 1))
+  .map((o) => ({ type: o.type, name: anon ? anonId('operation', o.type + ' ' + o.name) : o.name, file: anonId('file', relOf(o.file)), namedInE2e: !!o.inE2e }));
 
 function mdTable(headers, rows) {
   const out = ['| ' + headers.join(' | ') + ' |', '| ' + headers.map(() => '---').join(' | ') + ' |'];
@@ -1925,7 +3555,16 @@ function buildMarkdown(s) {
   L.push('End-to-end: ' + fmt(e.files) + ' files, ' + fmt(e.cases) + ' test cases' + (Object.keys(e.byFramework).length ? ' (' + Object.keys(e.byFramework).map((k) => k + ': ' + e.byFramework[k].cases).join(', ') + ')' : '') + '; ' + fmt(e.featureFiles) + ' .feature files with ' + fmt(e.scenarios) + ' scenarios.');
   L.push('Components with a sibling spec file: ' + fmt(c.withSpec) + ' of ' + fmt(c.count) + ' (' + pct(c.withSpec, c.count) + '%).');
   const cvPct = (x) => (x === null || x === undefined ? 'n/a' : x + '%');
-  for (const cv of s.tests.coverage) L.push('Coverage report' + (cv.path ? ' `' + cv.path + '`' : '') + ': lines ' + cvPct(cv.lines) + ', branches ' + cvPct(cv.branches) + ', functions ' + cvPct(cv.functions) + '.');
+  for (const cv of s.tests.coverage) L.push('Coverage report' + (cv.path ? ' `' + cv.path + '`' : '') + ', totals as reported: lines ' + cvPct(cv.lines) + ', branches ' + cvPct(cv.branches) + ', functions ' + cvPct(cv.functions) + '.');
+  const tg = s.testGaps;
+  const uc = tg.unitCoverage;
+  L.push(
+    uc.reportFound
+      ? 'Unit-test line coverage of the application files: ' + cvPct(uc.lines.pct) + ' in the report, about ' + cvPct(uc.adjustedLinePct) + ' once the ' + fmt(uc.absentFromReport.files) + ' application file(s) the report leaves out are counted.'
+      : 'Unit-test coverage: no coverage report was found (run the tests with coverage first, or pass --coverage).'
+  );
+  const neither = sum(BUCKETS, (b) => tg.matrix[b].neither);
+  L.push('Screens with a trace in the e2e tests: ' + fmt(tg.e2e.screens.total - tg.e2e.screens.noTrace - tg.e2e.screens.undecided) + ' of ' + fmt(tg.e2e.screens.total) + (tg.e2e.screens.undecided ? ' (' + fmt(tg.e2e.screens.undecided) + ' more cannot be decided)' : '') + '. Components with neither unit tests nor an e2e trace: ' + fmt(neither) + ' of ' + fmt(c.count) + ', and ' + fmt(sum(BUCKETS, (b) => tg.matrix[b].indirectOnly)) + ' more with no unit tests and an indirect e2e trace only. The lists are in test-gaps.md.');
   const tl = s.dependencies.tooling;
   const names = (a) => (a.length ? a.map((x) => x.name).join(', ') : 'none found');
   L.push('Tooling in package.json: unit: ' + names(tl.unit) + '; e2e: ' + names(tl.e2e) + '; other: ' + names(tl.other) + '.');
@@ -1975,6 +3614,454 @@ function buildMarkdown(s) {
   L.push('- Every .ts file under the scanned folder is counted. Backend TypeScript in the same repo shows up as framework-free code, so scan the frontend folders or read the per-project table.');
   L.push('- Route, guard and store numbers are syntactic matches, so unusual code styles can be under-counted.');
   L.push('- Tests are counted by `it(...)` / `test(...)` calls; a parameterised test counts once.');
+  L.push('- Unit coverage is read from an existing report, per file. The e2e trace is static: URLs, test ids and selectors found in the test code, matched against routes and templates. See test-gaps.md for what that can and cannot show.');
+  return L.join('\n') + '\n';
+}
+
+/* ------------------------------------------------------------------ *
+ * test-gaps.md: what the tests cover, what they miss
+ * ------------------------------------------------------------------ */
+function buildGapsMarkdown(s) {
+  const g = s.testGaps;
+  const uc = g.unitCoverage;
+  const ee = g.e2e;
+  const L = [];
+  const h = (t) => L.push('', '## ' + t, '');
+  const h3 = (t) => L.push('', '### ' + t, '');
+  const pc = (x) => (x === null || x === undefined || x === '' ? 'n/a' : x + '%');
+  const share = (a, b) => (b ? pct(a, b) + '%' : 'n/a');
+  const more = (list, max) => (list.length > max ? ['', '... and ' + fmt(list.length - max) + ' more, see the CSV files.'] : []);
+  const code = (x) => '`' + String(x).replace(/`/g, "'") + '`';
+  const cell = (x) => String(x).replace(/\|/g, '\\|');
+  const u = s.tests.unit;
+  const e = s.tests.e2e;
+  const t = ee.tests;
+
+  L.push('# Test safety net: ' + s.target);
+  L.push('');
+  L.push('Generated ' + s.generatedAt.slice(0, 10) + ' by ng-inventory ' + s.version + '. What the tests cover, what they miss, and where neither kind of test is in place.');
+
+  h('What exists');
+  const fw = Object.keys(e.byFramework).map((k) => k + ' ' + fmt(e.byFramework[k].cases));
+  const state = [];
+  if (t.skipped) state.push(fmt(t.skipped) + ' skipped');
+  if (t.pending) state.push(fmt(t.pending) + ' without a body');
+  if (t.only) state.push(fmt(t.only) + ' marked .only');
+  L.push(
+    mdTable(
+      ['Kind', 'Files', 'Tests', 'Notes'],
+      [
+        ['Unit tests', fmt(u.files), fmt(u.cases), u.cases ? 'TestBed-based: ' + share(u.testbed.cases, u.cases) : ''],
+        ['End-to-end tests', fmt(e.files), fmt(e.cases), fw.concat(state).join(', ')],
+        ['Gherkin scenarios', fmt(e.featureFiles), fmt(e.scenarios), ee.gherkin.stepDefinitions ? fmt(ee.gherkin.stepDefinitions) + ' step definitions' : ''],
+      ]
+    )
+  );
+
+  h('Unit tests: coverage');
+  if (!uc.reportFound) {
+    L.push('No coverage report was found, so there are no coverage numbers here.');
+    L.push('To get them, run the unit tests with coverage once (`ng test --no-watch --code-coverage`, or `jest --coverage`) and run this script again. A report that sits somewhere else can be passed with `--coverage <path>`.');
+    L.push('');
+    L.push('Until then, "has a spec file next to it with one test or more" stands in for unit coverage:');
+    L.push('');
+    const rows = [];
+    const add = (label, k) => rows.push([label, fmt(uc.byKind[k].count), fmt(uc.byKind[k].ok), fmt(uc.byKind[k].count - uc.byKind[k].ok)]);
+    for (const b of BUCKETS) add('Components, bucket ' + b, 'components' + b);
+    add('Services', 'services');
+    add('Guards, interceptors, resolvers', 'guardsInterceptorsResolvers');
+    add('Effects and stores', 'effectsAndStores');
+    add('Directives', 'directives');
+    add('Pipes', 'pipes');
+    L.push(mdTable(['Kind', 'Count', 'With a spec file', 'Without'], rows));
+  } else {
+    const reps = (s.tests.coverageReports || []).filter((r) => r.kind === 'unit');
+    L.push('Read from ' + reps.map((r) => (r.path ? code(r.path) + ' ' : '') + '(' + r.format + ', ' + fmt(r.matchedToApplicationFiles) + ' of ' + fmt(r.files) + ' files matched to application code)').join('; ') + '.');
+    L.push('');
+    L.push(
+      mdTable(
+        ['', 'Files', 'Lines', 'Covered', 'Coverage'],
+        [
+          ['Application files the report lists', fmt(uc.filesInReport), fmt(uc.lines.found), fmt(uc.lines.hit), pc(uc.lines.pct)],
+          ['Application files with code that the report does not list', fmt(uc.absentFromReport.files), '~' + fmt(uc.absentFromReport.estimatedLines), '0', '0%'],
+          ['All application code (estimate)', fmt(uc.filesInReport + uc.absentFromReport.files), '~' + fmt(uc.lines.found + uc.absentFromReport.estimatedLines), fmt(uc.lines.hit), pc(uc.adjustedLinePct)],
+        ]
+      )
+    );
+    L.push('');
+    L.push('A coverage report only lists the files that some test loaded. A file no test imports is missing from it, and that makes the reported percentage look better than it is. The second row adds those files back: ' + fmt(uc.absentFromReport.loc) + ' lines of code, converted to coverable lines at the ratio seen in the listed files.');
+    L.push('Branches: ' + pc(uc.branches.pct) + ', functions: ' + pc(uc.functions.pct) + ' (files in the report only).');
+    L.push('');
+    const rows = [];
+    const add = (label, k) => {
+      const x = uc.byKind[k];
+      rows.push([label, fmt(x.count), fmt(x.inReport), pc(x.linePct), fmt(x.none), fmt(x.partial), fmt(x.ok)]);
+    };
+    for (const b of BUCKETS) add('Components, bucket ' + b, 'components' + b);
+    add('Services', 'services');
+    add('Guards, interceptors, resolvers', 'guardsInterceptorsResolvers');
+    add('Effects and stores', 'effectsAndStores');
+    add('Directives', 'directives');
+    add('Pipes', 'pipes');
+    L.push(mdTable(['Kind', 'Count', 'In the report', 'Line coverage', 'Not covered (0% or not in the report)', 'Below ' + uc.okThresholdPct + '%', uc.okThresholdPct + '% or more'], rows));
+    L.push('');
+    L.push('Coverage is per file, so for a component it is the coverage of its .ts file; the template is not measured.');
+  }
+
+  h('End-to-end tests: what they reach');
+  if (!t.total && !ee.gherkin.scenarios) {
+    L.push('No end-to-end tests were found. They are looked for in folders named like e2e, e2e-playwright, app-e2e, cypress or playwright, and in files named *.cy.ts, *.e2e.ts or *.e2e-spec.ts.');
+  } else {
+    L.push('This part is a static trace. The script reads the test code and looks for URLs that are opened or asserted, for test ids (`data-testid`, `data-cy` and the like) and for component selectors. It then matches them against the routes and templates of the application. A test that finds its elements by visible text or by role leaves no trace, so "no trace" means "not shown to be covered", not "not covered".');
+    L.push('');
+    L.push(
+      mdTable(
+        ['Tests', 'Count'],
+        [
+          ['All', fmt(t.total)],
+          ['Active', fmt(t.active)],
+          ['Skipped (`.skip`, `xit`, `.fixme`, or inside a skipped suite)', fmt(t.skipped)],
+          ['Declared without a body', fmt(t.pending)],
+          ['Marked `.only`', fmt(t.only)],
+          ['Parameterised (`.each`)', fmt(t.parameterised)],
+          ['With named steps (`test.step`)', fmt(t.withSteps)],
+          ['No explicit check in the test body', fmt(t.noExplicitCheck)],
+        ]
+      )
+    );
+    L.push('');
+    const nv = ee.navigation;
+    L.push('URLs in the test code: ' + fmt(nv.visits) + ' navigations and ' + fmt(nv.urlAssertions) + ' URL assertions. ' + fmt(nv.resolved) + ' could be read, ' + fmt(nv.builtAtRunTime) + ' are built at run time. Of the readable ones, ' + fmt(nv.matchedARoute) + ' match a route and ' + fmt(nv.matchedNoRoute) + ' match none.');
+    L.push('Network stubs (`cy.intercept`, `page.route`): ' + fmt(ee.networkStubs) + '.');
+    if (ee.filesNotReadAsCode) L.push(fmt(ee.filesNotReadAsCode) + ' test file(s) could not be parsed and were only counted.');
+
+    const lk = ee.lookups;
+    const ds = lk.distinctSelectors;
+    const traceable = ds.byTestIdAttribute + ds.byComponentTag + ds.byIdNameOrFormControl + lk.callsThroughATestIdHelper;
+    const opaque = ds.byCssClass + ds.byOtherAttribute + lk.callsByTextRoleOrLabel;
+    if (traceable + opaque > 0) {
+      h3('How the tests find their elements');
+      L.push(
+        'Distinct selectors in the live test code: ' + fmt(ds.byTestIdAttribute) + ' by a test id attribute, ' + fmt(ds.byComponentTag) + ' by the tag of an application component, ' + fmt(ds.byIdNameOrFormControl) +
+          ' by an element id, a name or a form control name, ' + fmt(ds.byCssClass) + ' by a CSS class, ' + fmt(ds.byOtherAttribute) + ' by another attribute' +
+          (lk.otherAttributes.length ? ' (' + lk.otherAttributes.map((a) => a.name + ' ' + a.count).join(', ') + ')' : '') + '.'
+      );
+      L.push('Calls in the live test code: ' + fmt(lk.callsThroughATestIdHelper) + ' through a test id helper (`getByTestId` and the like), ' + fmt(lk.callsByTextRoleOrLabel) + ' by visible text, role or label (`contains`, `getByRole`, `getByText` and the like).');
+      L.push(
+        'Only test ids, component tags, ids, names and form control names can be matched against the templates.' +
+          (opaque > traceable ? ' Here most lookups are of the other kinds, so the lists below miss a good part of what the tests reach: read "no trace" with that in mind, or measure with an instrumented run.' : '')
+      );
+    }
+
+    h3('Screens');
+    const sc = ee.screens;
+    if (!sc.total) L.push('No routes that render a component were found in the application code.');
+    else {
+      L.push(
+        mdTable(
+          ['Screens (routes that render a component)', 'Count', 'Share'],
+          [
+            ['All', fmt(sc.total), ''],
+            ['Opened by a test (direct navigation, or a redirect from one)', fmt(sc.visited), share(sc.visited, sc.total)],
+            ['Not opened directly, but a test asserts their URL', fmt(sc.asserted), share(sc.asserted, sc.total)],
+          ]
+            .concat(g.e2eCoverage ? [['No URL in the tests, but code of the screen ran in the instrumented e2e run', fmt(sc.ran), share(sc.ran, sc.total)]] : [])
+            .concat([
+              ['No URL in the tests, but a test uses a test id or a selector that only this screen can put on the page', fmt(sc.byElement), share(sc.byElement, sc.total)],
+              ['Cannot be decided: the tests use a component or a test id that this screen shares with other screens', fmt(sc.undecided), share(sc.undecided, sc.total)],
+              ['No trace', fmt(sc.noTrace), share(sc.noTrace, sc.total)],
+            ])
+        )
+      );
+      L.push('');
+      L.push('"Only this screen" covers the screen itself, a screen below it, and a component that nothing else in the application uses. The same component under two paths counts for both.');
+      const rn = ee.routes;
+      const notes = [];
+      if (rn.unresolvedPaths) notes.push(fmt(rn.unresolvedPaths) + ' route path(s) are built from something the script could not resolve');
+      if (rn.lazyNotFollowed) notes.push(fmt(rn.lazyNotFollowed) + ' lazy-loaded route group(s) could not be followed to their routes');
+      if (rn.remote) notes.push(fmt(rn.remote) + ' route(s) load a remote microfrontend, whose own routes are not in this code base');
+      if (rn.notMounted) notes.push(fmt(rn.notMounted) + ' route(s) sit in arrays that nothing hands to the router, and are left out as dead code');
+      if (notes.length) L.push('', 'Limits of the route list: ' + notes.join('; ') + '.');
+    }
+
+    h3('Components');
+    L.push(
+      mdTable(
+        ['Bucket', 'Components', 'Direct trace', 'Indirect trace', 'No trace'],
+        BUCKETS.map((b) => {
+          const x = ee.components[b];
+          return [b, fmt(x.count), fmt(x.direct), fmt(x.indirect), fmt(x.none)];
+        })
+      )
+    );
+    L.push('');
+      L.push('Direct: a test opens or asserts the route of the component, or uses a test id, an element id, a name or the selector that only this component has, or the component is the only one that can put such a component on screen.');
+    L.push('Indirect: the component sits on a screen the tests reach, below a component with a direct trace (it may still be behind a condition that no test triggers). Or the trace points at two or three components at once and cannot say which: a test id that several components carry, a child that several components use. A trace that points at more than ' + SHARED_MAX + ' candidates is ignored: it says too little about any one of them.');
+    L.push(
+      'Test ids in templates: ' + fmt(ee.testIds.inTemplates) + ' (' + fmt(ee.testIds.sharedByComponents) + ' of them used by more than one component); found in the test code: ' + fmt(ee.testIds.namedInE2e) +
+        (ee.testIds.composedInE2e ? ', ' + fmt(ee.testIds.composedInE2e) + ' of these put together by a helper from a fixed part and a name (`${entity}DetailsHeading`)' : '') + '.' +
+        (ee.testIds.attributes.length ? ' Attributes read as test ids: ' + ee.testIds.attributes.map((a) => code(a.name) + ' ' + fmt(a.count)).join(', ') + (ee.testIds.attributesTakenFromTheTests.length ? ' (' + ee.testIds.attributesTakenFromTheTests.map(code).join(', ') + ' is not a usual name: it was taken from the selectors of the test code)' : '') + '.' : '')
+    );
+    if (!ee.testIds.inTemplates && t.total) L.push('No test id attribute was found in the templates. If the project marks its elements for tests in another way, the trace below rests on URLs, component tags, ids and names alone.');
+    const oh = ee.otherHandles;
+    if (oh.inTemplates) L.push('Element ids, names and form control names in templates: ' + fmt(oh.inTemplates) + ' (' + fmt(oh.sharedByComponents) + ' used by more than one component); selected by the test code: ' + fmt(oh.namedInE2e) + '.');
+    const go = ee.graphqlOperations;
+    if (go.named) L.push('Named GraphQL operations in the application: ' + fmt(go.named) + '; named in the test code (intercepted, mocked or awaited): ' + fmt(go.namedInE2e) + '. An operation can run in a test without being named.');
+    if (g.e2eCoverage) L.push('', 'A coverage report from an instrumented e2e run was read as well: ' + fmt(g.e2eCoverage.filesInReport) + ' application files, line coverage ' + pc(g.e2eCoverage.lines.pct) + ', ' + fmt(g.e2eCoverage.componentsRun) + (g.e2eCoverage.componentsRun === 1 ? ' component' : ' components') + ' ran. Those components count as a direct trace.' + (g.e2eCoverage.countsFunctions ? ' A file counts as run when one of its functions ran; lines that run when a file is merely loaded do not count.' : ' The report has no function counts, so a file counts as run when any of its lines ran, and that includes files that were only loaded.'));
+
+    if (!anon) {
+      const blank = routeList.filter((r) => isScreen(r) && !r.e2e);
+      if (blank.length) {
+        h3('Screens with no trace in the e2e tests');
+        const seen = new Set();
+        const rows = [];
+        for (const r of blank) {
+          const comp = r.comps[0];
+          const key = r.path + '|' + (comp ? comp.name : r.node.component);
+          if (seen.has(key)) continue;
+          seen.add(key);
+          rows.push([code(r.path), cell(comp ? comp.name : r.node.component || '(lazy component)'), comp ? comp.bucket : '', comp ? fmt(comp.totalLoc) : '', comp ? (comp.unitLinePct === '' ? comp.unit : comp.unitLinePct + '%') : '']);
+        }
+        L.push('No test opens these, asserts their URL, or uses a test id or selector of anything that is known to sit on them.');
+        L.push('');
+        L.push(mdTable(['Path', 'Component', 'Bucket', 'LOC', 'Unit tests'], rows.slice(0, 80)));
+        for (const x of more(rows, 80)) L.push(x);
+      }
+      const open = routeList.filter((r) => isScreen(r) && r.e2e === 'shared');
+      if (open.length) {
+        h3('Screens the trace cannot decide');
+        L.push('The tests use something these screens have, but other screens have it too: the same component under another path, a component that several screens use, a test id that several components carry. A test may reach them or not; look at the tests, or measure with an instrumented run.');
+        L.push('');
+        const seen = new Set();
+        const rows = [];
+        for (const r of open) {
+          const comp = r.comps[0];
+          const key = r.path + '|' + (comp ? comp.name : r.node.component);
+          if (seen.has(key)) continue;
+          seen.add(key);
+          rows.push([code(r.path), cell(comp ? comp.name : r.node.component || '(lazy component)'), comp ? comp.bucket : '', comp ? fmt(comp.totalLoc) : '', comp ? (comp.unitLinePct === '' ? comp.unit : comp.unitLinePct + '%') : '']);
+        }
+        L.push(mdTable(['Path', 'Component', 'Bucket', 'LOC', 'Unit tests'], rows.slice(0, 80)));
+        for (const x of more(rows, 80)) L.push(x);
+      }
+      const un = Object.keys(testGaps.unmatchedUrls)
+        .map((k) => [k, testGaps.unmatchedUrls[k]])
+        .sort((a, b) => b[1] - a[1]);
+      if (un.length) {
+        h3('URLs in tests that match no route');
+        L.push('Either the route list is incomplete (see the limits above), the application runs under a base path, or the test opens something outside this application.');
+        L.push('');
+        L.push(un.slice(0, 20).map((x) => code(x[0]) + (x[1] > 1 ? ' x' + x[1] : '')).join(', ') + (un.length > 20 ? ', ...' : ''));
+      }
+      const ops = Array.from(gqlOps.values()).filter((o) => !o.inE2e);
+      if (ops.length && go.named) {
+        h3('GraphQL operations the test code does not name');
+        L.push(ops.slice(0, 80).map((o) => code(o.type + ' ' + o.name)).join(', ') + (ops.length > 80 ? ', ... (' + fmt(ops.length - 80) + ' more in operations.csv)' : ''));
+      }
+    }
+  }
+
+  h('Where both nets are missing');
+  L.push('A component has unit tests here when ' + (uc.reportFound ? 'its file has ' + uc.okThresholdPct + '% line coverage or more' : 'it has a spec file with one test or more (no coverage report was found)') + ', and an e2e trace when it has a direct or an indirect trace.');
+  L.push('');
+  L.push(
+    mdTable(
+      ['Bucket', 'Components', 'Unit tests and e2e trace', 'Unit tests only', 'E2E trace only', '... of which indirect only', 'Neither'],
+      BUCKETS.map((b) => {
+        const x = g.matrix[b];
+        return [b, fmt(x.count), fmt(x.both), fmt(x.unitOnly), fmt(x.e2eOnly), fmt(x.indirectOnly), fmt(x.neither) + (x.count ? ' (' + pct(x.neither, x.count) + '%)' : '')];
+      })
+    )
+  );
+  L.push('');
+  L.push('"Indirect only" is the thin part of the net: no unit tests, and the component is only known to sit on a screen the tests reach. For a cautious count, add that column to "Neither".');
+  if (!anon) {
+    const rank = { XL: 3, L: 2, M: 1, S: 0 };
+    const bare = components.filter((c) => !c.unitOk && c.e2eLevel === 'none').sort((a, b) => rank[b.bucket] - rank[a.bucket] || b.totalLoc - a.totalLoc);
+    if (bare.length) {
+      h3('Largest components with neither');
+      L.push(mdTable(['Component', 'Bucket', 'LOC', 'Unit tests', 'File'], bare.slice(0, 40).map((c) => [cell(c.name), c.bucket, fmt(c.totalLoc), c.unitLinePct === '' ? c.unit : c.unitLinePct + '%', code(c.file)])));
+      for (const x of more(bare, 40)) L.push(x);
+    }
+    const thin = components.filter((c) => !c.unitOk && c.e2eLevel === 'indirect').sort((a, b) => rank[b.bucket] - rank[a.bucket] || b.totalLoc - a.totalLoc);
+    if (thin.length) {
+      h3('Largest components without unit tests and with an indirect e2e trace only');
+      L.push(mdTable(['Component', 'Bucket', 'LOC', 'Unit tests', 'E2E trace', 'File'], thin.slice(0, 20).map((c) => [cell(c.name), c.bucket, fmt(c.totalLoc), c.unitLinePct === '' ? c.unit : c.unitLinePct + '%', c.e2e, code(c.file)])));
+      for (const x of more(thin, 20)) L.push(x);
+    }
+    const svc = classes.filter((c) => (c.kind === 'service' || c.kind === 'effects' || c.kind === 'store' || c.kind === 'guard' || c.kind === 'interceptor' || c.kind === 'resolver') && !c.unitOk).sort((a, b) => b.loc - a.loc);
+    if (svc.length) {
+      h3('Largest services, stores and guards without unit tests');
+      L.push('E2E tests leave no static trace on these classes, so unit tests are the only evidence there is.');
+      L.push('');
+      L.push(mdTable(['Class', 'Kind', 'LOC', 'Unit tests', 'File'], svc.slice(0, 30).map((c) => [cell(c.name), c.kind, fmt(c.loc), c.unitLinePct === '' ? c.unit : c.unitLinePct + '%', code(c.file)])));
+      for (const x of more(svc, 30)) L.push(x);
+    }
+  } else L.push('', 'The lists behind these numbers are left out in anonymized mode.');
+
+  if (t.total) {
+    h('Tests that may protect less than they seem to');
+    L.push('- Skipped or without a body: ' + fmt(t.skipped + t.pending) + '. They show up in the test count but never run.');
+    L.push('- Marked `.only`: ' + fmt(t.only) + '. While one is in place, the rest of that file or suite does not run.');
+    L.push('- No explicit check in the test body: ' + fmt(t.noExplicitCheck) + ', of which ' + fmt(t.noCheckAndNoAction) + ' contain no action either. Many of these delegate to page objects or helpers that do the checking, so look before judging.');
+    L.push('- Titles shorter than three words: ' + fmt(ee.titles.shorterThan3Words) + ' (median title length: ' + (ee.titles.medianWords === null ? 'n/a' : ee.titles.medianWords + ' words') + ').');
+    if (!anon) {
+      const show = (title, list) => {
+        if (!list.length) return;
+        h3(title);
+        for (const x of list.slice(0, 25)) L.push('- ' + cell(x.suite.concat([x.title]).join(' > ')) + ' (' + code(x.file) + ')');
+        for (const y of more(list, 25)) L.push(y);
+      };
+      show('Skipped tests and tests without a body', e2eStatic.tests.filter((x) => x.status === 'skipped' || x.status === 'pending'));
+      show('Tests marked .only', e2eStatic.tests.filter((x) => x.status === 'only'));
+      show('Tests with no explicit check and no action in their body', e2eStatic.tests.filter((x) => (x.status === 'active' || x.status === 'only') && x.checks === 0 && x.actions === 0));
+    }
+  }
+
+  h('How to read this, and how to get a firmer answer');
+  L.push('- Everything about e2e tests here comes from reading the code, not from running it. A screen in the "no trace" list is a strong hint, not proof: a test that finds its elements by visible text or by role leaves no trace. A screen with a trace was reached by some test; whether that test checks anything there is a separate question.');
+  L.push('- A firmer answer is a coverage report from a real e2e run: build the application with Istanbul instrumentation (for Cypress, the `@cypress/code-coverage` plugin collects it; Playwright can collect V8 coverage in Chromium), then run this script with `--e2e-coverage <path to lcov.info>`. The components that ran are then marked in components.csv and count as a direct trace.');
+  L.push('- Coverage says which code ran, not that anything was checked. To test the tests, break something on purpose in a few places and see whether a test turns red.');
+  L.push('- components.csv has the raw columns: `unit`, `unitLinePct`, `e2e`, `testIds`, `testIdsInE2e`. In `e2e`: `route` (a test opens or asserts its URL), `root` (the root component), `testid` (a test id only this component has), `selector`, `attr` (an element id, a name or a form control name only this component has), `host` (the only component that can put a traced one on screen), `ran` (ran in an instrumented e2e run), then the weaker `screen`, `shared-id` and `shared-host`. routes.csv lists every route with its trace (`visited`, `asserted`, `ran`, `element`, `shared` or nothing), e2e-tests.csv every test.');
+  return L.join('\n') + '\n';
+}
+
+/* ------------------------------------------------------------------ *
+ * functional-spec.md: what the e2e tests say the application does
+ * ------------------------------------------------------------------ */
+function buildSpecMarkdown(s) {
+  const tests = e2eStatic.tests;
+  const features = e2eStatic.features.filter((f) => f.scenarios.length || f.name);
+  if (!tests.length && !features.length) return null;
+  const L = [];
+  const g = s.testGaps.e2e;
+  const esc = (x) => String(x).replace(/([*_`<>|])/g, '\\$1');
+  const flags = (t) => {
+    const f = [];
+    if (t.status === 'skipped') f.push('skipped');
+    if (t.status === 'pending') f.push('not written yet');
+    if (t.each) f.push('several data sets');
+    return f.length ? ' _(' + f.join(', ') + ')_' : '';
+  };
+  L.push('# What the application does, according to its end-to-end tests: ' + s.target);
+  L.push('');
+  L.push('Generated ' + s.generatedAt.slice(0, 10) + ' by ng-inventory ' + s.version + ' from ' + fmt(tests.length) + ' test titles in ' + fmt(new Set(tests.map((t) => t.file)).size) + ' test file(s)' + (features.length ? ' and ' + fmt(g.gherkin.scenarios) + ' Gherkin scenario(s) in ' + fmt(features.length) + ' feature file(s)' : '') + '.');
+  L.push('');
+  L.push('This is the behaviour of the application in the words of the people who wrote the tests: suites become headings, tests become list items. It covers only what has an end-to-end test, and it is as precise as the titles are. Screens that no test mentions are listed at the end.');
+  if (g.titles.medianWords !== null) L.push('', 'Title quality: the median title has ' + g.titles.medianWords + ' words; ' + fmt(g.titles.shorterThan3Words) + ' of ' + fmt(tests.length) + ' titles have fewer than three.');
+
+  const byFile = new Map();
+  for (const t of tests) {
+    if (!byFile.has(t.file)) byFile.set(t.file, []);
+    byFile.get(t.file).push(t);
+  }
+  const humanize = (file) => {
+    const base = file.split('/').pop().replace(/\.(cy|e2e-spec|e2e|pw|spec|test)\.(ts|js)$/i, '').replace(/\.(ts|js)$/i, '');
+    const words = base.replace(/[-_.]+/g, ' ').replace(/([a-z0-9])([A-Z])/g, '$1 $2').trim();
+    return words.charAt(0).toUpperCase() + words.slice(1);
+  };
+  const opens = new Map(); // file -> paths its live code opens, also outside tests (beforeEach, page objects are per file)
+  for (const n of e2eStatic.navs) {
+    if (n.kind !== 'visit') continue;
+    const segs = urlToSegs(n.raw);
+    if (!segs) continue;
+    if (!opens.has(n.file)) opens.set(n.file, []);
+    const p = '/' + segs.join('/');
+    if (opens.get(n.file).indexOf(p) === -1) opens.get(n.file).push(p);
+  }
+  for (const file of Array.from(byFile.keys()).sort()) {
+    // one section per top-level suite of the file; tests outside any suite get a section named after the file
+    const groups = new Map();
+    for (const t of byFile.get(file)) {
+      const top = t.suite[0] || '';
+      if (!groups.has(top)) groups.set(top, []);
+      groups.get(top).push(t);
+    }
+    let first = true;
+    for (const [top, list] of groups) {
+      const title = top || humanize(file) + (groups.size > 1 ? ' (tests outside a suite)' : '');
+      L.push('', '## ' + esc(title), '');
+      const urls = first ? opens.get(file) || [] : [];
+      L.push('`' + file + '` · ' + list[0].framework + ' · ' + fmt(list.length) + (list.length === 1 ? ' test' : ' tests') + (urls.length ? ' · opens ' + urls.slice(0, 6).map((x) => '`' + x + '`').join(', ') + (urls.length > 6 ? ', ...' : '') : ''));
+      first = false;
+      // tests that sit directly in the suite first, then its nested suites in the order they appear
+      const nested = new Map();
+      for (const t of list) {
+        const key = t.suite.slice(top ? 1 : 0).join('\u0000');
+        if (!nested.has(key)) nested.set(key, []);
+        nested.get(key).push(t);
+      }
+      const keys = Array.from(nested.keys()).sort((a, b) => (a === '' ? -1 : b === '' ? 1 : 0));
+      let prev = [];
+      for (const key of keys) {
+        const sp = key ? key.split('\u0000') : [];
+        let common = 0;
+        while (common < sp.length && common < prev.length && sp[common] === prev[common]) common++;
+        for (let i = common; i < sp.length; i++) {
+          if (i === 0) L.push('', '### ' + esc(sp[0]));
+          else if (i === 1) L.push('', '#### ' + esc(sp[1]));
+          else L.push('', '**' + esc(sp.slice(2, i + 1).join(' › ')) + '**');
+        }
+        L.push('');
+        prev = sp;
+        for (const t of nested.get(key)) {
+          L.push('- ' + esc(t.title || '(no title)') + flags(t));
+          for (const st of t.steps) L.push('  - ' + esc(st));
+        }
+      }
+    }
+  }
+  for (const f of features.slice().sort((a, b) => (a.file < b.file ? -1 : 1))) {
+    L.push('', '## Feature: ' + esc(f.name || f.file), '');
+    L.push('`' + f.file + '` · Gherkin · ' + fmt(f.scenarios.length) + (f.scenarios.length === 1 ? ' scenario' : ' scenarios') + (f.tags.length ? ' · ' + f.tags.join(' ') : ''));
+    if (f.description.length) L.push('', '> ' + esc(f.description.join(' ')));
+    L.push('');
+    if (f.background.length) {
+      L.push('- **Background**');
+      for (const st of f.background) L.push('  - ' + esc(st));
+    }
+    let rule = '';
+    for (const sc of f.scenarios) {
+      if (sc.rule !== rule) {
+        rule = sc.rule;
+        L.push('', '### Rule: ' + esc(rule), '');
+      }
+      L.push('- **' + esc(sc.name || '(no name)') + '**' + (sc.outline ? ' _(' + (sc.examples ? fmt(sc.examples) + ' examples' : 'outline') + ')_' : '') + (sc.tags.length ? ' ' + sc.tags.join(' ') : ''));
+      for (const st of sc.steps) L.push('  - ' + esc(st));
+    }
+  }
+  const blank = routeList.filter((r) => isScreen(r) && !r.e2e);
+  if (blank.length) {
+    L.push('', '## Screens that no test mentions', '');
+    L.push('Routes of the application that render a component and leave no trace in the test code: no test opens them, asserts their URL or addresses anything on them by test id or selector. Their behaviour is not described above.');
+    L.push('');
+    const seen = new Set();
+    let n = 0;
+    for (const r of blank) {
+      const name = r.comps[0] ? r.comps[0].name : r.node.component || '';
+      const key = r.path + '|' + name;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      if (++n <= 150) L.push('- `' + r.path + '`' + (!name ? '' : name.charAt(0) === '(' ? ' ' + name : ' (' + esc(name) + ')'));
+    }
+    if (n > 150) L.push('- ... and ' + fmt(n - 150) + ' more, see routes.csv');
+  }
+  const open = routeList.filter((r) => isScreen(r) && r.e2e === 'shared');
+  if (open.length) {
+    L.push('', '## Screens that a test may or may not reach', '');
+    L.push('The tests use a component or a test id that these screens share with other screens, so the test code alone cannot say whether they are described above.');
+    L.push('');
+    const seen = new Set();
+    let n = 0;
+    for (const r of open) {
+      const name = r.comps[0] ? r.comps[0].name : r.node.component || '';
+      const key = r.path + '|' + name;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      if (++n <= 150) L.push('- `' + r.path + '`' + (!name ? '' : name.charAt(0) === '(' ? ' ' + name : ' (' + esc(name) + ')'));
+    }
+    if (n > 150) L.push('- ... and ' + fmt(n - 150) + ' more, see routes.csv');
+  }
   return L.join('\n') + '\n';
 }
 
@@ -1983,6 +4070,20 @@ fs.writeFileSync(path.join(opts.out, 'summary.json'), JSON.stringify(summary, nu
 fs.writeFileSync(path.join(opts.out, 'summary.md'), buildMarkdown(summary));
 fs.writeFileSync(path.join(opts.out, 'components.csv'), csv(outComponents, COMPONENT_COLS));
 fs.writeFileSync(path.join(opts.out, 'classes.csv'), csv(outClasses, CLASS_COLS));
+fs.writeFileSync(path.join(opts.out, 'test-gaps.md'), buildGapsMarkdown(summary));
+const written = ['summary.md', 'summary.json', 'components.csv', 'classes.csv', 'test-gaps.md'];
+// a file from an earlier run must not survive when this run has nothing for it (or must not show names)
+const writeOrRemove = (name, content) => {
+  const p = path.join(opts.out, name);
+  if (content) {
+    fs.writeFileSync(p, content);
+    written.push(name);
+  } else if (fs.existsSync(p)) fs.unlinkSync(p);
+};
+writeOrRemove('functional-spec.md', anon ? null : buildSpecMarkdown(summary));
+writeOrRemove('routes.csv', outRoutes.length ? csv(outRoutes, ROUTE_COLS) : null);
+writeOrRemove('e2e-tests.csv', outE2eTests.length ? csv(outE2eTests, E2E_TEST_COLS) : null);
+writeOrRemove('operations.csv', outOperations.length ? csv(outOperations, OPERATION_COLS) : null);
 
 if (!opts.quiet) {
   const c = summary.components;
@@ -2005,8 +4106,19 @@ if (!opts.quiet) {
         ? 'Left out (not imported by the app; add with --include <folder>, or use --all): ' + scope.leftOut.slice(0, 8).map((o) => o.folder + ' ' + fmt(o.files) + ' files').join(', ') + (scope.leftOut.length > 8 ? ', ...' : '')
         : '',
       'Unit tests: ' + fmt(u.files) + ' files, ' + fmt(u.cases) + ' cases (TestBed-based ' + pct(u.testbed.cases, u.cases) + '%); e2e: ' + fmt(e2e.files) + ' files, ' + fmt(e2e.cases) + ' cases, ' + fmt(e2e.scenarios) + ' scenarios',
+      (() => {
+        const uc = testGaps.unitCoverage;
+        return uc.reportFound
+          ? 'Unit coverage (lines): ' + uc.lines.pct + '% in the report, about ' + uc.adjustedLinePct + '% with the ' + fmt(uc.absentFromReport.files) + ' application file(s) the report leaves out'
+          : 'Unit coverage: no report found (run the tests with coverage, or pass --coverage <path>)';
+      })(),
+      (() => {
+        const sc = testGaps.e2e.screens;
+        const m = testGaps.matrix;
+        return 'E2E trace: ' + fmt(sc.total - sc.noTrace - sc.undecided) + ' of ' + fmt(sc.total) + ' screens' + (sc.undecided ? ' (' + fmt(sc.undecided) + ' undecided)' : '') + '; components with neither unit tests nor e2e trace: ' + fmt(sum(BUCKETS, (b) => m[b].neither)) + ' of ' + fmt(c.count) + ' (XL ' + m.XL.neither + ', L ' + m.L.neither + '), indirect e2e trace only: ' + fmt(sum(BUCKETS, (b) => m[b].indirectOnly));
+      })(),
       agg.misc.parseErrors ? 'Files that could not be analysed: ' + agg.misc.parseErrors : '',
-      'Report written to ' + opts.out + ' in ' + (summary.environment.durationMs / 1000).toFixed(1) + 's',
+      'Report written to ' + opts.out + ' in ' + (summary.environment.durationMs / 1000).toFixed(1) + 's: ' + written.join(', '),
     ]
       .filter(Boolean)
       .join('\n')
